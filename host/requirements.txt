@@ -1,0 +1,3 @@
+# No additional packages beyond the existing xr_teleoperate environment.
+# Needed only for keyboard_2xl430.py on the Windows host PC.
+dynamixel-sdk>=3.7

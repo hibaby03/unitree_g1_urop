@@ -1,0 +1,5 @@
+dynamixel-sdk>=3.7
+numpy>=1.24,<3
+PyYAML>=6,<7
+# teleimager is installed from xr_teleoperate's pinned submodule.
+# PyZED ships with the matching Stereolabs ZED SDK/JetPack installation.

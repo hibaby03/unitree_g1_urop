@@ -1,0 +1,37 @@
+# ZED Mini active-stereo-only configuration for Unitree teleimager.
+# image_shape is the COMBINED [height, width] frame: left | right.
+webrtc:
+  bitrate:
+    min: 2000000
+    default: 8000000
+    max: 12000000
+  gop_length: 30
+
+head_camera:
+  enable_zmq: true       # required for xr_teleoperate --record
+  zmq_port: 55555
+  enable_webrtc: true    # direct low-latency stream to Quest
+  webrtc_port: 60001
+  webrtc_codec: h264
+  type: opencv           # replaced by zed_teleimager_server at runtime
+  image_shape: [720, 2560]
+  binocular: true
+  # Match xr_teleoperate's default 30 Hz episode/control loop. Raising this to
+  # 60 improves display smoothness but doubles PC2 JPEG/WebRTC work while the
+  # recorder still samples at 30 Hz unless --frequency is also changed.
+  fps: 30
+  zed_resolution: hd720
+  zed_camera_id: 0
+  zed_serial_number: null
+  video_id: 0
+  serial_number: null
+  physical_path: null
+
+# Disabled deliberately: the paper's A baseline uses only active stereo.
+left_wrist_camera:
+  enable_zmq: false
+  enable_webrtc: false
+
+right_wrist_camera:
+  enable_zmq: false
+  enable_webrtc: false
