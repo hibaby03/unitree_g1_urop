@@ -1,0 +1,5 @@
+# ACT training (GPU PC). Install torch/torchvision matching your CUDA first.
+torch>=2.1
+torchvision>=0.16
+numpy
+pillow
