@@ -2,10 +2,13 @@ import unittest
 
 from pc2.dynamixel_neck import (
     ADDR_GOAL_POSITION,
+    ADDR_PRESENT_POSITION,
     LEN_GOAL_POSITION,
     DynamixelNeck,
+    DynamixelNeckError,
     NeckConfiguration,
     angle_to_position,
+    position_to_angle,
 )
 
 
@@ -66,6 +69,28 @@ class FakeSyncWrite:
         self.parameters.clear()
 
 
+class FakeSyncRead:
+    def __init__(self, _port, _packet, address, length):
+        self.address = address
+        self.length = length
+        self.ids = []
+        self.present = {}
+        self.result = 0
+
+    def addParam(self, motor_id):
+        self.ids.append(motor_id)
+        return True
+
+    def txRxPacket(self):
+        return self.result
+
+    def isAvailable(self, motor_id, address, length):
+        return motor_id in self.present and (address, length) == (self.address, self.length)
+
+    def getData(self, motor_id, _address, _length):
+        return self.present[motor_id] & 0xFFFFFFFF
+
+
 class FakeSdk:
     COMM_SUCCESS = 0
 
@@ -73,6 +98,11 @@ class FakeSdk:
         self.port = None
         self.packet = FakePacket()
         self.sync_write = None
+        self.sync_read = None
+
+    def GroupSyncRead(self, port, packet, address, length):
+        self.sync_read = FakeSyncRead(port, packet, address, length)
+        return self.sync_read
 
     def PortHandler(self, device):
         self.port = FakePort(device)
@@ -102,6 +132,11 @@ class AngleToPositionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             angle_to_position(0.0, 2048, 0)
 
+    def test_position_to_angle_inverts_angle_to_position(self):
+        self.assertEqual(position_to_angle(3072, 2048, 1), 90.0)
+        self.assertEqual(position_to_angle(3072, 2048, -1), -90.0)
+        self.assertEqual(position_to_angle(2048, 2048, 1), 0.0)
+
 
 class DynamixelNeckTests(unittest.TestCase):
     def test_connect_and_sync_write_both_axes(self):
@@ -129,6 +164,42 @@ class DynamixelNeckTests(unittest.TestCase):
         neck.close()
         self.assertTrue(sdk.port.closed)
         self.assertFalse(neck.torque_enabled)
+
+    def test_read_present_angles_uses_center_and_sign(self):
+        sdk = FakeSdk()
+        neck = DynamixelNeck(
+            NeckConfiguration(yaw_sign=1, pitch_sign=-1),
+            sdk_module=sdk,
+        )
+        neck.connect()
+        self.assertEqual(sdk.sync_read.address, ADDR_PRESENT_POSITION)
+        self.assertEqual(sdk.sync_read.ids, [1, 2])
+        sdk.sync_read.present = {1: 2048 + 1024, 2: 2048 + 1024}
+
+        angles, positions = neck.read_present_angles()
+
+        self.assertEqual(positions, (3072, 3072))
+        self.assertEqual(angles, (90.0, -90.0))
+
+    def test_present_position_is_signed(self):
+        sdk = FakeSdk()
+        neck = DynamixelNeck(NeckConfiguration(), sdk_module=sdk)
+        neck.connect()
+        sdk.sync_read.present = {1: -5, 2: 10}
+
+        self.assertEqual(neck.read_present_positions(), (-5, 10))
+
+    def test_sync_read_failure_raises(self):
+        sdk = FakeSdk()
+        neck = DynamixelNeck(NeckConfiguration(), sdk_module=sdk)
+        neck.connect()
+        sdk.sync_read.result = 1
+        with self.assertRaises(DynamixelNeckError):
+            neck.read_present_positions()
+        sdk.sync_read.result = 0
+        sdk.sync_read.present = {1: 2048}
+        with self.assertRaises(DynamixelNeckError):
+            neck.read_present_positions()
 
 
 if __name__ == "__main__":

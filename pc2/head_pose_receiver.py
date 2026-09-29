@@ -23,6 +23,7 @@ try:
         DynamixelNeckError,
         NeckConfiguration,
     )
+    from .neck_state_sender import NeckState, NeckStateUdpSender
 except ImportError:
     from active_camera_protocol import (  # type: ignore[no-redef]
         PACKET_SIZE,
@@ -36,6 +37,7 @@ except ImportError:
         DynamixelNeckError,
         NeckConfiguration,
     )
+    from neck_state_sender import NeckState, NeckStateUdpSender  # type: ignore[no-redef]
 
 
 def positive_float(value: str) -> float:
@@ -85,6 +87,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=positive_float,
         default=250.0,
         help="report tracking stale after this interval",
+    )
+    feedback = parser.add_argument_group("neck state feedback to the Host")
+    feedback.add_argument(
+        "--neck-state-port",
+        type=int,
+        default=5006,
+        help="UDP port on the Host for yaw/pitch command and encoder state",
+    )
+    feedback.add_argument(
+        "--neck-state-host",
+        default=None,
+        help="Host address for neck state; default is the head-pose sender",
+    )
+    feedback.add_argument(
+        "--no-neck-state",
+        action="store_true",
+        help="do not send neck state back to the Host",
     )
     motor = parser.add_argument_group("2XL430 motor output")
     motor.add_argument(
@@ -138,6 +157,11 @@ def run(args: argparse.Namespace) -> int:
         )
         neck = DynamixelNeck(configuration)
         neck.connect()
+
+    state_sender: Optional[NeckStateUdpSender] = None
+    if not args.no_neck_state:
+        state_sender = NeckStateUdpSender(args.neck_state_port)
+    last_state_error: Optional[str] = None
 
     receive_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     receive_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -248,6 +272,46 @@ def run(args: argparse.Namespace) -> int:
                     target.pitch_deg,
                 )
 
+            if state_sender is not None:
+                present_deg = present_position = present_time_ns = None
+                state_error = None
+                if neck is not None:
+                    try:
+                        present_time_ns = time.monotonic_ns()
+                        present_deg, present_position = neck.read_present_angles()
+                    except DynamixelNeckError as error:
+                        present_time_ns = None
+                        state_error = f"encoder read failed: {error}"
+                try:
+                    state_sender.send(
+                        args.neck_state_host or source[0],
+                        NeckState(
+                            pose_sequence=target.sequence,
+                            command_pc2_monotonic_ns=(
+                                motor_command_pc2_time_ns or sample_pc2_time_ns
+                            ),
+                            command_deg=(target.yaw_deg, target.pitch_deg),
+                            goal_position=motor_positions,
+                            present_pc2_monotonic_ns=present_time_ns,
+                            present_deg=present_deg,
+                            present_position=present_position,
+                            torque_enabled=neck is not None and neck.torque_enabled,
+                        ),
+                    )
+                except OSError as error:
+                    state_error = f"send failed: {error}"
+                # Report each distinct failure once instead of at the pose rate.
+                if state_error != last_state_error and state_error is not None:
+                    print(
+                        json.dumps(
+                            {"event": "neck_state_error", "reason": state_error},
+                            separators=(",", ":"),
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                last_state_error = state_error
+
             if now_monotonic - last_print_monotonic < print_period:
                 continue
             last_print_monotonic = now_monotonic
@@ -277,6 +341,8 @@ def run(args: argparse.Namespace) -> int:
         return 0
     finally:
         receive_socket.close()
+        if state_sender is not None:
+            state_sender.close()
         if neck is not None:
             neck.close()
 

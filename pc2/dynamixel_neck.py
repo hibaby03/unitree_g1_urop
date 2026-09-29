@@ -13,8 +13,10 @@ ADDR_TORQUE_ENABLE = 64
 ADDR_PROFILE_ACCELERATION = 108
 ADDR_PROFILE_VELOCITY = 112
 ADDR_GOAL_POSITION = 116
+ADDR_PRESENT_POSITION = 132
 
 LEN_GOAL_POSITION = 4
+LEN_PRESENT_POSITION = 4
 POSITION_CONTROL_MODE = 3
 TORQUE_DISABLE = 0
 TORQUE_ENABLE = 1
@@ -44,6 +46,19 @@ def angle_to_position(
     pulses = angle_deg * (PULSES_PER_REVOLUTION / DEGREES_PER_REVOLUTION)
     position = int(round(center_position + direction_sign * pulses))
     return max(MIN_POSITION, min(MAX_POSITION, position))
+
+
+def position_to_angle(
+    position: int,
+    center_position: int,
+    direction_sign: int,
+) -> float:
+    """Inverse of angle_to_position (without clamping)."""
+
+    if direction_sign not in (-1, 1):
+        raise ValueError("direction_sign must be -1 or 1")
+    pulses = (position - center_position) * direction_sign
+    return pulses * (DEGREES_PER_REVOLUTION / PULSES_PER_REVOLUTION)
 
 
 @dataclass(frozen=True)
@@ -99,6 +114,15 @@ class DynamixelNeck:
             ADDR_GOAL_POSITION,
             LEN_GOAL_POSITION,
         )
+        self._sync_read = sdk_module.GroupSyncRead(
+            self._port,
+            self._packet,
+            ADDR_PRESENT_POSITION,
+            LEN_PRESENT_POSITION,
+        )
+        for motor_id in self._motor_ids:
+            if not self._sync_read.addParam(motor_id):
+                raise DynamixelNeckError(f"could not add motor {motor_id} to Sync Read")
         self._connected = False
         self._torque_enabled = False
 
@@ -179,6 +203,45 @@ class DynamixelNeck:
             self._sync_write.clearParam()
 
         return yaw_position, pitch_position
+
+    def read_present_positions(self) -> Tuple[int, int]:
+        """Read both encoders in one Sync Read (signed 32-bit counts)."""
+
+        if not self._connected:
+            raise DynamixelNeckError("neck is not connected")
+        result = self._sync_read.txRxPacket()
+        if result != self._sdk.COMM_SUCCESS:
+            detail = self._packet.getTxRxResult(result)
+            raise DynamixelNeckError(f"Sync Read failed: {detail}")
+        positions = []
+        for motor_id in self._motor_ids:
+            if not self._sync_read.isAvailable(
+                motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
+            ):
+                raise DynamixelNeckError(f"no present position from motor {motor_id}")
+            value = int(self._sync_read.getData(
+                motor_id, ADDR_PRESENT_POSITION, LEN_PRESENT_POSITION
+            )) & 0xFFFFFFFF
+            positions.append(value - 0x100000000 if value >= 0x80000000 else value)
+        return positions[0], positions[1]
+
+    def read_present_angles(self) -> Tuple[Tuple[float, float], Tuple[int, int]]:
+        """Return ((yaw_deg, pitch_deg), (yaw_count, pitch_count))."""
+
+        yaw_position, pitch_position = self.read_present_positions()
+        angles = (
+            position_to_angle(
+                yaw_position,
+                self.configuration.yaw_center,
+                self.configuration.yaw_sign,
+            ),
+            position_to_angle(
+                pitch_position,
+                self.configuration.pitch_center,
+                self.configuration.pitch_sign,
+            ),
+        )
+        return angles, (yaw_position, pitch_position)
 
     def torque_off(self) -> None:
         if not self._connected:

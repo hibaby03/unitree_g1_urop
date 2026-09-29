@@ -18,10 +18,11 @@ G1 static head camera와 wrist camera를 모두 비활성화한다.
 ```text
 Quest Meta Browser
   ├─ OpenXR head pose ─ HTTPS/WSS :8012 ─> Host TeleVuer
-  │                                           └─ UDP :5005 ─> PC2
-  │                                                              └─ U2D2
-  │                                                                 ├─ yaw
-  │                                                                 └─ pitch
+  │                                           ├─ UDP :5005 ─> PC2 head_pose_receiver
+  │                                           │                  └─ U2D2
+  │                                           │                     ├─ yaw
+  │                                           │                     └─ pitch
+  │                                           └─ UDP :5006 <─ 목 명령/엔코더 yaw·pitch
   │
   └─ left/right eye video <──── WebRTC :60001 ─────┐
                                                     │
@@ -38,10 +39,18 @@ ZED Mini ─ USB 3 ─> PC2 PyZED ─> rectified left|right frame
   주입하고 기존 config/ZMQ/WebRTC publisher 재사용
 - `pc2/cam_config_zed.yaml`: active-stereo-only 카메라 설정
 - `host/run_teleop_with_neck.py`: 기존 teleop 실행과 동시에 raw OpenXR head pose 송신
+- `host/teleop_record_dex3_tactile.py`: G1_29 + Dex3-1 teleop 루프. head pose 송신과
+  함께 팔·손·Dex3-1 tactile·목 yaw/pitch를 episode에 녹화
 - `host/head_pose_udp.py`: OpenXR matrix 검증, quaternion 변환, UDP packet 생성
-- `pc2/head_pose_receiver.py`: UDP 수신, 최초 pose 중립점, yaw/pitch 제한
-- `pc2/dynamixel_neck.py`: U2D2를 통한 두 축 DYNAMIXEL Sync Write
-- `PROTOCOL.md`: 고정 48-byte head-pose UDP packet 규격
+- `host/neck_state_receiver.py`: PC2가 보낸 목 명령/엔코더 packet 수신과 녹화용 변환
+- `host/keyboard_2xl430.py`: Windows에서 2XL430 두 축을 키보드로 움직이는 확인용 도구
+  (`host/README_2XL430_KEYBOARD_KO.md`)
+- `pc2/head_pose_receiver.py`: UDP 수신, 최초 pose 중립점, yaw/pitch 제한, 목 상태
+  피드백 송신
+- `pc2/dynamixel_neck.py`: U2D2를 통한 두 축 DYNAMIXEL Sync Write / 엔코더 Sync Read
+- `pc2/neck_state_sender.py`: 목 명령/엔코더 상태 UDP packet 생성
+- `PROTOCOL.md`: head-pose(48 byte, Host→PC2)와 neck-state(60 byte, PC2→Host)
+  UDP packet 규격
 
 ZED 송신기는 별도 영상 프로토콜을 만들지 않는다. 최신 `xr_teleoperate`가 사용하는
 `teleimager.ImageClient`와 `TeleVuerWrapper`가 서버 설정을 그대로 읽는다.
@@ -140,7 +149,73 @@ python3 pc2/head_pose_receiver.py \
   --motor-timeout-ms 1000
 ```
 
+모터 위치는 `center + sign × 각도 × 4096/360`이다. 기본 center는 2048이므로
+오른쪽/위로 10°면 2048 + 114, 왼쪽/아래로 10°면 2048 − 114 count가 된다. 방향이
+반대면 `--yaw-sign -1` 또는 `--pitch-sign -1`을 준다.
+
+`--yaw-id`/`--pitch-id`/`--dxl-baudrate`는 실제 모터 설정과 같아야 한다.
+`host/keyboard_2xl430.py`의 기본값(ID 5/6, 57600 bps)은 이 receiver의 기본값
+(ID 1/2, 1,000,000 bps)과 다르므로, 키보드 도구로 확인한 값을 그대로 넣는다.
+
 U2D2 USB만으로 모터 전원을 공급하지 말고 2XL430용 외부 전원을 사용한다.
+
+### 목 상태 피드백 (PC2 → Host)
+
+receiver는 pose를 받아 명령할 때마다 두 모터의 Present Position을 Sync Read 한 번으로
+읽고, 명령값과 엔코더 값을 60-byte UDP packet으로 Host에 돌려보낸다. 기본 목적지는
+head pose를 보낸 주소의 `5006` 포트다.
+
+| 옵션 | 의미 |
+| --- | --- |
+| `--neck-state-port 5006` | Host 수신 포트 |
+| `--neck-state-host <ip>` | 목적지를 직접 지정 (기본: head pose 송신 주소) |
+| `--no-neck-state` | 피드백 끄기 |
+
+`--enable-motor` 없이 실행하면 명령값만 보내고 엔코더 값은 비어 있다. 엔코더 읽기나
+송신이 실패하면 `{"event":"neck_state_error",...}`를 stderr에 한 번 출력하고, 명령은
+계속한다.
+
+## 3-1. G1 없이 영상 + 목만 확인 (`--input-mode=none`)
+
+Quest 헤드셋, PC2의 ZED Mini와 2XL430만으로 실시간 영상과 목 추종을 함께
+확인한다. Quest 손 컨트롤러와 G1/Dex3 연결은 필요 없다. Host 실행기는
+팔·손 컨트롤러, IK, DDS, 녹화기를 초기화하지 않는다. PC2 코드는 수정하지 않는다.
+
+1. PC2에서 기존 `python3 pc2/zed_teleimager_server.py`를 실행한다.
+2. Host에서 아래 명령을 실행하고 Quest에서 기존 Host HTTPS/WSS 주소로 접속해
+   VR 세션에 들어간다. 인증서 경로는 기존 영상 확인 때 사용한 값으로 바꾼다.
+
+```bash
+cd ~/hckang/xr_teleoperate
+python active_camera_host/run_teleop_with_neck.py \
+  --xr-repo . \
+  --input-mode=none \
+  --video-offer-url https://192.168.123.164:60001/offer \
+  --video-cert /path/to/cert.pem --video-key /path/to/key.pem \
+  --neck-pose-ip 192.168.123.164 --neck-pose-port 5005 --neck-pose-rate 60
+```
+
+3. PC2의 다른 터미널에서 먼저 모터 없이 `python3 pc2/head_pose_receiver.py`를
+   실행해 머리를 돌릴 때 yaw/pitch가 갱신되는지 확인한다. 중단한 뒤 정면을 보고
+   3절의 `--enable-motor` 명령을 실제 ID, baudrate, center, sign에 맞춰 실행한다.
+   첫 시험은 yaw/pitch 제한을 각각 15도로 낮춰 확인한다.
+4. 머리를 천천히 좌우·위아래로 움직이며 목 추종과 Quest 영상의 연속성을 확인한다.
+   녹화는 하지 않는다. Host에서 Ctrl+C로 종료한다.
+
+이 모드는 기존 영상 전용 모드와 같은 legacy TeleVuer API 및 Linux `fork`
+실행 환경을 사용한다. `--input-mode=none`은 `--record`, `--arm`, `--ee` 등
+전체 teleop 옵션이나 `--video-only`와 함께 사용할 수 없다. 영상 주소와 목 UDP
+주소는 각각 `--video-offer-url`, `--neck-pose-ip`로 지정한다.
+
+새 `CAMERA_MOVE`가 250 ms 이상 들어오지 않으면 머리 자세 송신을 멈춘다.
+PC2는 마지막 정상 패킷 이후 기존 `--motor-timeout-ms`(기본 1000 ms)가 지나면
+토크를 끄고 종료한다. 정상 자세가 한 번도 오지 않은 경우도 PC2 시작 시점부터
+타임아웃을 적용하므로 Host/Quest를 먼저 준비한다. 타임아웃 후에는 PC2 목
+수신기를 다시 실행해야 한다. 이 검사는 이벤트 수신 중단을 감지하며,
+Quest 자체 추적 품질을 별도로 판정하지는 않는다.
+
+기존 `--video-only`는 계속 영상만 표시하며 머리 자세 UDP를 보내지 않는다.
+`--input-mode=hand` / `controller` 및 입력 모드 생략은 기존 전체 teleop 경로다.
 
 ## 4. Host teleoperation과 episode 기록
 
@@ -179,22 +254,78 @@ https://192.168.123.2:8012/?ws=wss://192.168.123.2:8012
 
 녹화된 각 timestep에는 ZED left/right가 각각 `color_0`, `color_1`로 저장된다.
 G1 static head camera와 wrist camera는 기본 config에서 꺼져 있으므로 논문의
-active-stereo-only visual observation과 일치한다.
+active-stereo-only visual observation과 일치한다. 이 launcher는 설치된
+`teleop_hand_and_arm.py`를 그대로 실행하므로 Dex3-1 tactile과 목 yaw/pitch는
+저장하지 않는다.
 
-## 데이터셋 관점에서 중요한 제한
+### 4-1. 팔·손·tactile·목 값을 함께 녹화
 
-현재 변경으로 stereo observation과 기존 arm/hand state/action은 episode에
-저장된다. 그러나 논문 Fig. 3처럼 ACT policy가 추론 시 카메라 자체도 움직이게
-하려면 데이터셋의 state/action vector에 다음 2-DoF 값도 포함해야 한다.
+`host/teleop_record_dex3_tactile.py`는 G1_29 + Dex3-1 + hand tracking 전용
+teleop/녹화 스크립트다. `teleop_hand_and_arm.py`와 같은 모듈(TeleVuerWrapper,
+G1_29_ArmIK/Controller, Dex3_1_Controller, ImageClient, EpisodeWriter)로 루프를 직접
+돌리며, 기존 launcher처럼 head pose를 PC2로 보낸다. PC2에서는 2·3절의
+`zed_teleimager_server.py`와 `head_pose_receiver.py`를 그대로 실행한다.
+
+```bash
+cd ~/xr_teleoperate
+python active_camera_host/teleop_record_dex3_tactile.py \
+  --xr-repo . \
+  --img-server-ip 192.168.123.164 \
+  --neck-pose-ip 192.168.123.164 --neck-pose-port 5005 --neck-pose-rate 60 \
+  --neck-state-port 5006 \
+  --record \
+  --task-dir ./utils/data --task-name active_stereo_task
+```
+
+키는 기존과 같다: `r` 추종 시작, `s` episode 시작/저장, `q` 종료. `--motion`,
+`--headless`, `--display-mode`, `--network-interface`, `--frequency`(기본 30)와
+`--task-goal/desc/steps`도 받는다. `--arm`, `--ee`, `--input-mode`는 고정이므로 주지
+않는다. `--task-dir`는 기존과 같이 `teleop/` 기준 상대 경로다.
+
+각 item에 저장되는 값:
+
+| 키 | 내용 |
+| --- | --- |
+| `colors.color_0` / `color_1` | ZED left / right |
+| `states.left_arm/right_arm` | `qpos` 현재 q, `qvel` 현재 dq |
+| `actions.left_arm/right_arm` | `qpos` IK 결과 q, `torque` feed-forward tau |
+| `states/actions.left_ee/right_ee` | Dex3-1 손 state/action 각 7개 |
+| `tactiles.left_ee/right_ee` | Dex3-1 press sensor별 `pressure`[12], `temperature`[12], `lost`, 수신 후 경과 `age_ms` (한 번도 안 받았으면 `null`) |
+| `states.neck` | 엔코더 [yaw, pitch] `qpos`(rad), `position_counts`, `pc2_monotonic_ns`, `age_ms` |
+| `actions.neck` | 명령 [yaw, pitch] `qpos`(rad), goal `position_counts`, `pc2_monotonic_ns`, `pose_sequence`, `torque_enabled`, `age_ms` |
+
+목 yaw는 오른쪽, pitch는 위가 양수이며 center(기본 2048) 기준이다. Host는 녹화
+시점에 가장 최근 packet을 넣으므로, 더 정밀한 정렬이 필요하면 `pc2_monotonic_ns`로
+보간한다. 목 packet을 아직 받지 못했으면 `neck.qpos`는 빈 리스트다.
+
+Dex3-1 tactile은 `Dex3_1_Controller`와 별도로 `rt/dex3/{left,right}/state`를 콜백
+방식으로 구독하여 `HandState_.press_sensor_state`를 읽는다. 한쪽 손 데이터가 끊겨도
+다른 쪽은 계속 갱신된다.
+
+> **Host xr_teleoperate 버전 확인 필요.** 이 스크립트는 최신 upstream API
+> (`teleimager.ImageClient`, `TeleVuerWrapper(display_mode=, zmq=, webrtc=,
+> webrtc_url=, arm_reference_mode=)`)를 기준으로 작성되었다. Host에 예전 TeleVuer
+> (`img_shm_name` 기반)가 설치되어 있으면 생성자 호출이 실패하므로, 아래 결과로
+> 버전을 먼저 확인한다.
+>
+> ```bash
+> cd ~/hckang/xr_teleoperate
+> git log -1 --format='%H %cd'
+> grep -n "def __init__" -A3 teleop/televuer/src/televuer/tv_wrapper.py
+> ```
+
+## 데이터셋 관점: active-camera state/action
+
+논문 Fig. 3처럼 ACT policy가 추론 시 카메라 자체도 움직이게 하려면 데이터셋의
+state/action vector에 다음 2-DoF 값이 포함되어야 한다.
 
 - state: encoder에서 읽은 실제 active-camera yaw/pitch joint position
 - action: 해당 timestep의 commanded yaw/pitch target
 
-현재 `xr_teleoperate`의 기본 `EpisodeWriter`와 이 폴더의 일방향 pose UDP에는 이
-두 값의 feedback/recording 경로가 아직 없다. 따라서 지금 수집한 영상은 active
-viewpoint를 포함하지만, 그대로는 policy가 카메라 관절 명령을 출력하도록 학습할
-수 없다. 이 항목은 실제 모터 present-position feedback과 EpisodeWriter 확장으로
-추가해야 논문의 완전한 `A` policy action/state space가 된다.
+`host/teleop_record_dex3_tactile.py`와 PC2 neck state 피드백(UDP 5006)으로 이 두
+값이 `states.neck`, `actions.neck`에 저장된다(4-1절). 기존
+`run_teleop_with_neck.py --record`에는 여전히 목 값이 저장되지 않으므로, policy
+학습용 데이터는 4-1절 스크립트로 수집한다.
 
 ## PC2 clock 동기화 원칙
 
@@ -207,11 +338,15 @@ Unix timestamp를 sensor alignment 기준으로 사용하지 않는다.
 - ZED: 한 번의 성공한 `grab()` 직후 `latest_pc2_monotonic_ns` 기록
 - ZED SDK image timestamp: `latest_zed_image_time_ns`에 진단용으로 별도 보존
 - neck target: receiver가 target을 만든 PC2 monotonic timestamp를 로그에 기록
-- motor command: 실제 Sync Write 직전 PC2 monotonic timestamp를 로그에 기록
+- motor command: 실제 Sync Write 직전 PC2 monotonic timestamp를 로그와 neck-state
+  packet(`command_pc2_monotonic_ns`)에 기록
+- encoder: Present Position Sync Read 직전 PC2 monotonic timestamp를 neck-state
+  packet(`present_pc2_monotonic_ns`)에 기록
 
-아직 dataset 수집 단계가 아니므로 encoder history buffer, frame/state resampling,
-EpisodeWriter 병합은 구현하지 않는다. 이후 수집기를 만들 때 같은 PC2 monotonic
-domain에서 `image`, `actual motor state`, `motor command`를 정렬하면 된다.
+녹화 스크립트는 두 목 timestamp를 `states.neck`/`actions.neck.pc2_monotonic_ns`로
+episode에 남긴다. ZED frame의 PC2 timestamp는 아직 ZMQ JPEG stream으로 Host에 전달되지
+않으므로, episode 안에서 image와 목 값은 Host 녹화 시점 기준의 최신값끼리 묶인다.
+frame/state resampling은 아직 구현하지 않았다.
 
 ## 포트
 
@@ -220,6 +355,7 @@ domain에서 `image`, `actual motor state`, `motor command`를 정렬하면 된�
 - `60001/TCP/UDP`: ZED head-camera WebRTC signaling/media
 - `55555/TCP`: 녹화용 stereo JPEG ZMQ stream
 - `5005/UDP`: Host에서 PC2로 보내는 head pose
+- `5006/UDP`: PC2에서 Host로 돌려보내는 목 명령/엔코더 yaw·pitch
 
 ## 테스트
 
@@ -228,6 +364,9 @@ cd active_camera
 python3 -m unittest discover -s tests -v
 ```
 
-테스트는 packet, matrix/quaternion, yaw/pitch, motor position 변환과 함께 ZED
-좌우 배치 및 active-stereo-only 설정 검증을 수행한다. ZED/Quest/U2D2 실기
+테스트는 packet, matrix/quaternion, yaw/pitch, motor position 변환, 엔코더 Sync Read,
+neck-state packet 왕복·UDP 수신, Dex3-1 tactile 변환, 녹화 state/action 배치와 함께
+ZED 좌우 배치 및 active-stereo-only 설정 검증을 수행한다. 하드웨어와
+xr_teleoperate 없이 가짜 SDK/DDS 객체로 실행된다. `test_zed_stereo`는 `numpy`가
+필요하다. ZED/Quest/U2D2 실기
 end-to-end 동작은 하드웨어에서 별도로 확인해야 한다.

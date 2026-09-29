@@ -6,12 +6,13 @@ TeleVuer/network/process boundaries are faked; these do not verify Quest renderi
 import asyncio
 from contextlib import ExitStack
 import importlib
+import multiprocessing
 from multiprocessing import shared_memory
 from pathlib import Path
 import signal
 import sys
 import tempfile
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -67,6 +68,9 @@ class VideoOnlyTests(unittest.TestCase):
 
             async def main_image_webrtc(self, session, fps=60):
                 raise AssertionError("original video method must not run")
+
+            async def on_cam_move(self, event, session, fps=60):
+                pass
 
         package.TeleVuer = FakeTeleVuer
         stack.enter_context(patch.dict(sys.modules, {
@@ -134,6 +138,107 @@ class VideoOnlyTests(unittest.TestCase):
         with ExitStack() as stack:
             args, instances, _ = self._environment(stack, process, fail_init=True)
             with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+                launcher.run_video_only(args)
+            with self.assertRaises(FileNotFoundError):
+                shared_memory.SharedMemory(name=instances[0].shm_name)
+        process.close.assert_called_once()
+
+
+class NeckOnlyTests(unittest.TestCase):
+    _environment = VideoOnlyTests._environment
+
+    def test_none_bypasses_robot_entrypoint(self):
+        with patch.object(launcher, "run_video_only", return_value=0) as viewer, \
+                patch.object(launcher.runpy, "run_path") as full, \
+                patch.object(launcher.os, "chdir") as chdir:
+            self.assertEqual(launcher.main(["--input-mode=none"]), 0)
+        self.assertEqual(viewer.call_args.args[0].input_mode, "none")
+        full.assert_not_called()
+        chdir.assert_not_called()
+
+    def test_argument_conflicts_and_port_are_rejected(self):
+        for arguments in (
+            ["--input-mode=none", "--video-only"],
+            ["--input-mode=none", "--record"],
+            ["--input-mode=none", "--arm=G1_29"],
+        ):
+            with self.subTest(arguments=arguments), patch("sys.stderr"), self.assertRaises(SystemExit):
+                launcher.parse_launcher_args(arguments)
+        with patch.object(launcher, "run_video_only") as viewer, self.assertRaises(ValueError):
+            launcher.main(["--input-mode=none", "--neck-pose-port=0"])
+        viewer.assert_not_called()
+
+    def test_hand_and_controller_are_forwarded(self):
+        for mode in ("hand", "controller"):
+            args, remaining = launcher.parse_launcher_args([f"--input-mode={mode}", "--record"])
+            self.assertEqual(remaining, ["--input-mode", mode, "--record"])
+            self.assertFalse(args.video_only)
+
+    def test_stale_or_uninitialized_pose_does_not_renew_watchdog(self):
+        shared = multiprocessing.Array("d", 17, lock=True)
+        sender = Mock()
+        with patch.object(launcher.time, "monotonic", return_value=10.0):
+            self.assertFalse(launcher.send_fresh_head_pose(shared, sender))
+            shared[16] = 9.0
+            self.assertFalse(launcher.send_fresh_head_pose(shared, sender))
+        sender.send_openxr_matrix.assert_not_called()
+
+    def test_none_forwards_camera_events_and_cleans_up_on_interrupt(self):
+        from host import head_pose_udp
+        import builtins
+        original_import = builtins.__import__
+
+        def guarded(name, *args, **kwargs):
+            if name.startswith(("unitree_sdk2py", "teleop.robot_control", "teleimager")):
+                self.fail(f"neck-only mode imported robot/recording dependency: {name}")
+            return original_import(name, *args, **kwargs)
+
+        process = Mock(pid=123)
+        process.is_alive.side_effect = [True, True, True, False, False]
+        with ExitStack() as stack:
+            args, instances, _ = self._environment(stack, process)
+            args.video_only = False
+            args.input_mode = "none"
+            sender = stack.enter_context(patch.object(head_pose_udp, "HeadPoseUdpSender")).return_value
+            stack.enter_context(patch("builtins.__import__", side_effect=guarded))
+
+            def join(timeout):
+                if not getattr(join, "called", False):
+                    join.called = True
+                    # Column-major pose with translation; unchanged poses must
+                    # still refresh when a new CAMERA_MOVE arrives.
+                    event = SimpleNamespace(value={"camera": {"matrix": [
+                        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1,
+                    ]}})
+                    asyncio.run(instances[0].on_cam_move(event, None))
+                else:
+                    process.join.side_effect = None
+                    raise KeyboardInterrupt
+
+            process.join.side_effect = join
+            self.assertEqual(launcher.run_video_only(args), 0)
+            sender.send_openxr_matrix.assert_called_once_with([
+                [1, 0, 0, 1], [0, 1, 0, 2], [0, 0, 1, 3], [0, 0, 0, 1],
+            ])
+            sender.close.assert_called_once()
+            sample = list(instances[0].neck_pose_shared[:])
+            bad_event = SimpleNamespace(value={"camera": {"matrix": [0] * 16}})
+            asyncio.run(instances[0].on_cam_move(bad_event, None))
+            self.assertEqual(list(instances[0].neck_pose_shared[:]), sample)
+            with self.assertRaises(FileNotFoundError):
+                shared_memory.SharedMemory(name=instances[0].shm_name)
+        process.terminate.assert_called_once()
+        process.close.assert_called_once()
+
+    def test_sender_creation_failure_stops_video_and_releases_memory(self):
+        from host import head_pose_udp
+        process = Mock(pid=123)
+        process.is_alive.return_value = False
+        with ExitStack() as stack:
+            args, instances, _ = self._environment(stack, process)
+            args.input_mode = "none"
+            stack.enter_context(patch.object(head_pose_udp, "HeadPoseUdpSender", side_effect=OSError("socket failed")))
+            with self.assertRaisesRegex(OSError, "socket failed"):
                 launcher.run_video_only(args)
             with self.assertRaises(FileNotFoundError):
                 shared_memory.SharedMemory(name=instances[0].shm_name)

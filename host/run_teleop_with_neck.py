@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run full teleop with neck forwarding, or a video-only Quest viewer.
+"""Run full teleop, video only, or stereo video with head-driven neck control.
 
 This launcher replaces TeleVuerWrapper only inside the current Python process.
 It does not start a second Vuer server and does not modify xr_teleoperate files.
@@ -37,23 +37,42 @@ def parse_launcher_args(
     parser.add_argument("--neck-pose-port", type=int, default=5005)
     parser.add_argument("--neck-pose-rate", type=positive_rate, default=60.0)
     parser.add_argument(
+        "--input-mode", choices=("hand", "controller", "none"), default=None,
+        help="none: stereo video and neck only; hand/controller: full robot teleop",
+    )
+    parser.add_argument(
         "--video-only", action="store_true",
         help="Display PC2 stereo video without robot control, pose UDP, or recording",
     )
     parser.add_argument(
         "--video-offer-url", default="https://192.168.123.164:60001/offer",
-        help="PC2 HTTPS WebRTC offer endpoint (video-only)",
+        help="PC2 HTTPS WebRTC offer endpoint (video-only or input-mode=none)",
     )
     parser.add_argument("--video-cert", help="Host TLS certificate; or XR_TELEOP_CERT")
     parser.add_argument("--video-key", help="Host TLS private key; or XR_TELEOP_KEY")
     args, remaining = parser.parse_known_args(argv)
-    if args.video_only:
+    if args.video_only and args.input_mode is not None:
+        parser.error("--video-only and --input-mode cannot be combined")
+    if args.video_only or args.input_mode == "none":
         if remaining in (["--help"], ["-h"]):
             parser.print_help()
             parser.exit()
         if remaining:
-            parser.error("--video-only does not accept teleop arguments: " + " ".join(remaining))
+            parser.error("video/neck-only mode does not accept teleop arguments: " + " ".join(remaining))
+    elif args.input_mode is not None:
+        remaining = ["--input-mode", args.input_mode, *remaining]
     return args, remaining
+
+
+def send_fresh_head_pose(pose_shared, sender, max_age=0.25) -> bool:
+    """Do not renew the PC2 watchdog using a cached pose after XR disconnects."""
+    with pose_shared.get_lock():
+        sample = list(pose_shared[:])
+    if sample[16] <= 0 or time.monotonic() - sample[16] > max_age:
+        return False
+    matrix = [sample[offset:offset + 4] for offset in range(0, 16, 4)]
+    sender.send_openxr_matrix(matrix)
+    return True
 
 
 def _stop_video_process(process) -> None:
@@ -84,6 +103,14 @@ def run_video_only(args: argparse.Namespace) -> int:
     import signal
     import ssl
     from urllib.parse import urlsplit
+
+    neck_only = args.input_mode == "none"
+    label = "neck-only" if neck_only else "video-only"
+    if neck_only:
+        try:
+            from .head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix
+        except ImportError:
+            from head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix
 
     endpoint = urlsplit(args.video_offer_url)
     if (endpoint.scheme != "https" or not endpoint.hostname
@@ -120,14 +147,40 @@ def run_video_only(args: argparse.Namespace) -> int:
     if (not required.issubset(inspect.signature(TeleVuer.__init__).parameters)
             or not hasattr(TeleVuer, "main_image_webrtc")):
         raise RuntimeError("Installed TeleVuer API differs from the inspected Host version")
+    if neck_only and not hasattr(TeleVuer, "on_cam_move"):
+        raise RuntimeError("Neck-only mode requires TeleVuer.on_cam_move")
 
     class VideoOnlyTeleVuer(TeleVuer):
         def __init__(self, **kwargs):
+            # Allocate before TeleVuer forks its server. Both processes share
+            # the validated pose and receipt time under one lock.
+            if neck_only:
+                self.neck_pose_shared = multiprocessing.Array("d", 17, lock=True)
             try:
                 super().__init__(**kwargs)
             except BaseException:
                 _stop_video_process(getattr(self, "process", None))
                 raise
+
+        async def on_cam_move(self, event, session, fps=60):
+            await super().on_cam_move(event, session)
+            if not neck_only:
+                return
+            try:
+                flat = event.value["camera"]["matrix"]
+                if len(flat) != 16:
+                    return
+                # Vuer CAMERA_MOVE matrices use column-major OpenXR order.
+                matrix = _validated_pose_matrix([
+                    [flat[column * 4 + row] for column in range(4)]
+                    for row in range(4)
+                ])
+            except (KeyError, TypeError, ValueError, IndexError):
+                return
+            with self.neck_pose_shared.get_lock():
+                self.neck_pose_shared[:] = [
+                    value for row in matrix for value in row
+                ] + [time.monotonic()]
 
         async def main_image_webrtc(self, session, fps=60):
             # Do not mount Hands or MotionControllers, or override eye layers.
@@ -150,6 +203,7 @@ def run_video_only(args: argparse.Namespace) -> int:
     image_shape = (720, 2560, 3)
     shm = None
     viewer = None
+    sender = None
     previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
     try:
         # Legacy TeleVuer attaches this even in WebRTC mode. No video is relayed
@@ -160,19 +214,40 @@ def run_video_only(args: argparse.Namespace) -> int:
             img_shape=image_shape, img_shm_name=shm.name,
             cert_file=str(cert_path), key_file=str(key_path), webrtc=True,
         )
-        print(f"[video-only] TeleVuer process started: PID {viewer.process.pid}", flush=True)
-        print(f"[video-only] Quest video source: {args.video_offer_url}", flush=True)
-        print("[video-only] No robot control, pose UDP, or recording. Ctrl+C to stop.", flush=True)
+        print(f"[{label}] TeleVuer process started: PID {viewer.process.pid}", flush=True)
+        print(f"[{label}] Quest video source: {args.video_offer_url}", flush=True)
+        if neck_only:
+            sender = HeadPoseUdpSender(args.neck_pose_ip, args.neck_pose_port)
+            print(f"[{label}] Head pose UDP: {args.neck_pose_ip}:{args.neck_pose_port} "
+                  f"at up to {args.neck_pose_rate:g} Hz. Enter VR before starting the PC2 motor receiver. "
+                  "No arm/hand control or recording. Ctrl+C to stop.", flush=True)
+        else:
+            print("[video-only] No robot control, pose UDP, or recording. Ctrl+C to stop.", flush=True)
+        period = 1.0 / args.neck_pose_rate if neck_only else 0.5
+        last_send_error = None
         while viewer.process.is_alive():
-            viewer.process.join(timeout=0.5)
+            loop_start = time.monotonic()
+            if sender is not None:
+                try:
+                    if send_fresh_head_pose(viewer.neck_pose_shared, sender):
+                        last_send_error = None
+                except (OSError, ValueError) as error:
+                    if str(error) != last_send_error:
+                        print(f"[{label}] Head pose send failed: {error}", file=sys.stderr, flush=True)
+                    last_send_error = str(error)
+            viewer.process.join(timeout=max(0.0, period - (time.monotonic() - loop_start)))
         raise RuntimeError(f"TeleVuer server exited unexpectedly (code {viewer.process.exitcode})")
     except KeyboardInterrupt:
-        print("\n[video-only] Stopping.", flush=True)
+        print(f"\n[{label}] Stopping.", flush=True)
         return 0
     finally:
         try:
-            if viewer is not None:
-                _stop_video_process(viewer.process)
+            try:
+                if sender is not None:
+                    sender.close()
+            finally:
+                if viewer is not None:
+                    _stop_video_process(viewer.process)
         finally:
             try:
                 if shm is not None:
@@ -192,6 +267,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not 1 <= launcher_args.neck_pose_port <= 65535:
         raise ValueError("--neck-pose-port must be in 1..65535")
+    if launcher_args.input_mode == "none":
+        return run_video_only(launcher_args)
 
     repository = Path(launcher_args.xr_repo).expanduser().resolve()
     teleop_script = repository / "teleop" / "teleop_hand_and_arm.py"
