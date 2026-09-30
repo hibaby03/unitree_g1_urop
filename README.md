@@ -327,6 +327,49 @@ state/action vector에 다음 2-DoF 값이 포함되어야 한다.
 `run_teleop_with_neck.py --record`에는 여전히 목 값이 저장되지 않으므로, policy
 학습용 데이터는 4-1절 스크립트로 수집한다.
 
+## 5. ACT 학습과 실행
+
+`training/train_act.py`는 4-1절로 녹화한 task 폴더(`episode_*/data.json`)를 그대로
+읽는다. 입력은 ZED `color_0`/`color_1`과 30차원 state(팔 7+7, Dex3-1 7+7, 목 2),
+출력은 같은 순서의 action chunk다. `--no-neck`은 목을 빼고 학습한다.
+
+```bash
+pip install -r training/requirements.txt
+python training/train_act.py \
+  --data-dir ~/xr_teleoperate/teleop/utils/data/active_stereo_task \
+  --out-dir runs/act_active_stereo
+```
+
+`host/deploy_act.py`는 학습된 체크포인트로 팔·손·목을 제어한다. PC2에서는 녹화 때와
+같이 `zed_teleimager_server.py`와 `head_pose_receiver.py --enable-motor`를 실행한다.
+Quest는 필요 없다. Host의 `tv` 환경에 torch/torchvision이 있어야 하며, `host`만
+복사했다면 `--train-script`로 `train_act.py` 경로를 준다.
+
+```bash
+cd ~/xr_teleoperate
+python active_camera_host/deploy_act.py \
+  --xr-repo . \
+  --checkpoint /path/to/policy_best.ckpt \
+  --train-script /path/to/training/train_act.py \
+  --img-server-ip 192.168.123.164 \
+  --neck-pose-ip 192.168.123.164 \
+  --dry-run
+```
+
+키: `r` 시작/재개, `p` 일시정지(마지막 명령 유지), `q` 종료. 처음에는 `--dry-run`으로
+명령 없이 예측값만 확인한 뒤 뺀다.
+
+- 팔: `G1_29_ArmController`에 관절 목표와 pinocchio RNEA 중력 보상 torque를 보낸다.
+- 손: retargeting 없이 `rt/dex3/{left,right}/cmd`에 관절 목표를 직접 보낸다
+  (`Dex3_1_Controller`와 같은 kp 1.5 / kd 0.2).
+- 목: yaw/pitch를 OpenXR quaternion으로 바꿔 기존 head-pose packet으로 보낸다. 시작
+  시 recenter flag로 identity를 중립점으로 잡으므로 목이 먼저 center로 이동한다.
+- 모든 명령은 step마다 `--max-arm-step`(0.05 rad), `--max-hand-step`(0.1 rad),
+  `--max-neck-step-deg`(3°)로 제한되어 첫 정책 출력으로도 천천히 들어간다.
+- 기본은 ACT temporal ensembling(`--ensemble-k 0.01`)이며, `--no-temporal-agg`로
+  chunk를 open-loop로 실행할 수 있다. `--frequency`는 녹화 주파수(30)와 같아야 한다.
+- 종료 시 목은 center로 천천히 돌아가고, 팔은 녹화 스크립트와 같이 home으로 이동한다.
+
 ## PC2 clock 동기화 원칙
 
 카메라와 두 목 모터가 모두 PC2에 연결되므로, 향후 dataset 동기화의 canonical
