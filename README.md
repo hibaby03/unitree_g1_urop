@@ -370,6 +370,66 @@ python active_camera_host/deploy_act.py \
   chunk를 open-loop로 실행할 수 있다. `--frequency`는 녹화 주파수(30)와 같아야 한다.
 - 종료 시 목은 center로 천천히 돌아가고, 팔은 녹화 스크립트와 같이 home으로 이동한다.
 
+### 5-1. 이미 처리한 예외 상황
+
+실제 녹화·실행에서 오류가 날 수 있어 미리 처리한 부분이다.
+
+`training/train_act.py`
+
+- 녹화 중 ZED 프레임이 `None`이면 해당 item이 `colors={}`로 저장된다. 이 프레임은
+  앞(없으면 뒤) 프레임 이미지로 채우고 경고만 출력한다.
+- `s`로 저장하기 전에 녹화가 죽으면 `data.json`이 닫히지 않아 JSON이 깨진다
+  (`EpisodeWriter`는 item을 이어 쓰고 저장 시 `]}`를 붙인다). 이 에피소드는 건너뛴다.
+- 목 값이 에피소드 전체에서 비어 있으면(PC2를 `--enable-motor` 없이 실행) 그
+  에피소드는 건너뛴다. 일부 timestep만 비어 있으면 앞뒤 값으로 채운다.
+
+`host/deploy_act.py`
+
+- `--dry-run`은 목 packet을 보내지 않아 PC2 목 상태도 오지 않으므로, 목 state를
+  center(0)로 두고 진행한다.
+- 일시정지 중이나 state/영상이 잠시 비었을 때도 마지막 명령을 계속 다시 보낸다.
+- 종료 시 목을 약 1초에 걸쳐 center로 되돌린다. PC2는 자체 속도 제한이 없어
+  바로 0을 보내면 목이 튄다.
+- `--train-script` 경로가 없으면 바로 명확한 오류를 낸다.
+
+### 5-2. 아직 남은 알려진 문제
+
+아래는 확인됐거나 가능성이 있는 문제로, 아직 코드에 반영하지 않았다. 실기 실행 전에
+우회 방법을 따르거나 수정한다.
+
+**`host/deploy_act.py`**
+
+1. **PC2 목 receiver가 먼저 종료된다 (확인됨).** `head_pose_receiver.py --enable-motor`는
+   시작 후 `--motor-timeout-ms`(기본 1000 ms) 안에 pose가 오지 않으면 토크를 끄고
+   종료한다. deploy는 `r`을 누른 뒤에야 목 packet을 보내므로 README 순서대로 PC2를
+   먼저 켜면 receiver가 이미 죽어 있고, `r` 후 3초 뒤 "no arm/hand/neck state"로
+   멈춘다.
+   - 우회: PC2 receiver에 `--motor-timeout-ms`를 충분히 크게 준다(예: 60000). 이
+     값은 통신이 끊겼을 때 토크를 끄는 watchdog이기도 하므로 실행 중에는 목을 계속
+     지켜본다.
+2. **실행 직후 팔이 0 자세로 빠르게 이동한다 (확인됨).** upstream
+   `G1_29_ArmController`는 `q_target = zeros(14)`로 생성되고 250 Hz 제어 스레드를
+   바로 시작하며, 속도 제한은 30 rad/s다. 따라서 dry-run이 아니면 `r` 전부터 팔이
+   0 자세로 거의 순간 이동한다. 종료 시 `ctrl_dual_arm_go_home`도 같은 속도다.
+   녹화 스크립트와 upstream teleop도 동일하게 동작한다.
+   - 우회: 로봇을 매단 상태에서 팔 주변을 비우고 실행한다.
+3. **센서가 끊겨도 마지막 값으로 계속 제어한다 (가능성).** 팔/손 state의 수신 시각을
+   검사하지 않는다. ZED 영상도 `get_head_frame()`이 마지막 프레임을 계속 돌려주면
+   끊김을 감지하지 못한다.
+4. **`--query-every`가 chunk 크기보다 크면 IndexError (확인됨).** `--no-temporal-agg`와
+   함께 쓸 때만 해당한다. chunk 크기 이하로 준다.
+
+**`training/train_act.py`**
+
+5. **`--resume` 시 정규화 통계와 train/val 분할이 바뀐다 (확인됨).** 통계를
+   체크포인트에서 가져오지 않고 현재 데이터로 다시 계산한다. 그 사이 에피소드를
+   추가했다면 오류 없이 다른 정규화로 이어서 학습되고, 기존 학습 에피소드가 val로
+   넘어갈 수 있다.
+   - 우회: 에피소드를 추가했다면 resume하지 말고 새로 학습한다.
+6. **에피소드가 4개 이하이면 `policy_best.ckpt`가 생기지 않는다 (확인됨).**
+   `round(n × val_ratio)`가 0이 되어 val 세트가 없기 때문이다. 이때는
+   `policy_last.ckpt`를 쓴다.
+
 ## PC2 clock 동기화 원칙
 
 카메라와 두 목 모터가 모두 PC2에 연결되므로, 향후 dataset 동기화의 canonical
