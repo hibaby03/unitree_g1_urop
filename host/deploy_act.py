@@ -18,6 +18,11 @@ head_pose_receiver.py --enable-motor as for recording.
 Every command is rate-limited per control step relative to the previous
 command, which also ramps the robot smoothly into the first policy output.
 
+The ZED frame's age is measured from its PC2 capture stamp and a Host/PC2
+clock offset (host/frame_timing.py). A frame older than --max-image-age-ms
+(e.g. a frozen or lagging stream) is not fed to the policy; the last command
+is held instead.
+
 Keys (sshkeyboard):
   r: start / resume the policy   p: pause (hold the last command)   q: quit
 """
@@ -38,9 +43,12 @@ from typing import Any, Optional, Sequence
 import numpy as np
 
 try:
+    from .frame_timing import DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader
     from .head_pose_udp import FLAG_ORIENTATION_VALID, FLAG_TRACKED, MAGIC, PACKET_STRUCT, VERSION
     from .neck_state_receiver import NeckStateReceiver
 except ImportError:
+    from frame_timing import (  # type: ignore[no-redef]
+        DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader)
     from head_pose_udp import (  # type: ignore[no-redef]
         FLAG_ORIENTATION_VALID, FLAG_TRACKED, MAGIC, PACKET_STRUCT, VERSION)
     from neck_state_receiver import NeckStateReceiver  # type: ignore[no-redef]
@@ -76,6 +84,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--xr-repo", default="~/hckang/xr_teleoperate",
                         help="xr_teleoperate repository root")
     parser.add_argument("--img-server-ip", default="192.168.123.164")
+    parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT,
+                        help="PC2 clock-sync UDP port (zed_teleimager_server.py)")
+    parser.add_argument("--no-clock-sync", action="store_true",
+                        help="do not probe the PC2 clock; image age is not checked")
+    parser.add_argument("--max-image-age-ms", type=positive_float, default=200.0,
+                        help="hold the last command when the ZED frame is older than this")
     parser.add_argument("--network-interface", default=None,
                         help="DDS network interface, e.g. eth0")
     parser.add_argument("--motion", action="store_true",
@@ -106,7 +120,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true",
                         help="read sensors and run the policy, but send no robot/neck commands")
     args = parser.parse_args(argv)
-    for name in ("neck_pose_port", "neck_state_port"):
+    for name in ("neck_pose_port", "neck_state_port", "clock_sync_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be in 1..65535")
     return args
@@ -398,7 +412,7 @@ def run(args: argparse.Namespace) -> int:
     from teleimager.image_client import ImageClient
 
     keys = KeyState()
-    img_client = arm_reader = hand_readers = neck_state = neck_cmd = arm_ctrl = None
+    img_client = clock_sync = arm_reader = hand_readers = neck_state = neck_cmd = arm_ctrl = None
     keyboard_thread = None
     try:
         ChannelFactoryInitialize(0, networkInterface=args.network_interface)
@@ -409,9 +423,13 @@ def run(args: argparse.Namespace) -> int:
         )
         keyboard_thread.start()
 
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        # StampedFrameReader decodes the JPEG itself so image and stamp match.
+        img_client = ImageClient(host=args.img_server_ip, request_bgr=False)
         if not img_client.get_cam_config()["head_camera"]["binocular"]:
             raise RuntimeError("expected the ZED binocular head camera (cam_config_zed.yaml)")
+        head_frames = StampedFrameReader(img_client.get_head_frame)
+        if not args.no_clock_sync:
+            clock_sync = ClockSyncClient(args.img_server_ip, args.clock_sync_port)
         arm_reader = LatestJointReader(ChannelSubscriber, TOPIC_LOWSTATE, LowState_,
                                        range(G1_29_ARM_MOTOR_OFFSET,
                                              G1_29_ARM_MOTOR_OFFSET + G1_29_NUM_ARM_JOINTS))
@@ -460,6 +478,20 @@ def run(args: argparse.Namespace) -> int:
                 # dry run sends no head pose, so PC2 sends no neck state: use center
             return state
 
+        age_unknown_warned = False
+
+        def image_age_ms(frame) -> Optional[float]:
+            nonlocal age_unknown_warned
+            clock = clock_sync.estimate() if clock_sync is not None else None
+            if frame.stamp is None or clock is None:
+                if not age_unknown_warned and not args.no_clock_sync:
+                    logger.warning("image age unknown (no PC2 frame stamp or clock sync); "
+                                   "stale frames will not be detected")
+                    age_unknown_warned = True
+                return None
+            host_capture_ns = clock.pc2_to_host_ns(frame.stamp.capture_pc2_monotonic_ns)
+            return (time.monotonic_ns() - host_capture_ns) / 1e6
+
         max_step = np.zeros_like(runner.action_mean, dtype=np.float64)
         for key in ("left_arm", "right_arm"):
             max_step[slices[key]] = args.max_arm_step
@@ -490,12 +522,23 @@ def run(args: argparse.Namespace) -> int:
         command: Optional[np.ndarray] = None
         chunk: Optional[np.ndarray] = None
         t = 0
+        next_tick = time.monotonic()
+
+        def wait_next_tick() -> None:
+            # Monotonic fixed-rate schedule, same as the recorder.
+            nonlocal next_tick
+            next_tick += period
+            remaining = next_tick - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(remaining)
+            else:
+                next_tick = time.monotonic()
+
         while not keys.stop:
-            loop_start = time.time()
             if not keys.running:
                 if command is not None:
                     send(command)  # keep streaming the held pose while paused
-                time.sleep(period)
+                wait_next_tick()
                 continue
 
             if keys.resumed:
@@ -504,9 +547,9 @@ def run(args: argparse.Namespace) -> int:
                     # Recenter PC2 on identity; the neck moves to center first.
                     neck_cmd = NeckCommandSender(args.neck_pose_ip, args.neck_pose_port,
                                                  args.neck_pose_rate)
-                deadline = time.time() + 3.0
+                deadline = time.monotonic() + 3.0
                 state = read_state()
-                while state is None and time.time() < deadline and not keys.stop:
+                while state is None and time.monotonic() < deadline and not keys.stop:
                     time.sleep(0.05)
                     state = read_state()
                 if state is None:
@@ -517,14 +560,22 @@ def run(args: argparse.Namespace) -> int:
                 command = state.copy()  # rate limiting starts from the measured pose
                 ensembler.reset()
                 t = 0
+                next_tick = time.monotonic()
                 logger.info("Policy running.")
 
             state = read_state()
-            head_bgr = img_client.get_head_frame().bgr
+            frame = head_frames.read()
+            head_bgr = frame.bgr
             if state is None or head_bgr is None:
                 logger.warning("missing state or head image; holding")
                 send(command)
-                time.sleep(period)
+                wait_next_tick()
+                continue
+            age_ms = image_age_ms(frame)
+            if age_ms is not None and age_ms > args.max_image_age_ms:
+                logger.warning(f"head image is {age_ms:.0f} ms old; holding")
+                send(command)
+                wait_next_tick()
                 continue
 
             if args.no_temporal_agg:
@@ -541,12 +592,14 @@ def run(args: argparse.Namespace) -> int:
                 delta = np.abs(target - state)
                 arm = max(delta[slices["left_arm"]].max(), delta[slices["right_arm"]].max())
                 hand = max(delta[slices["left_ee"]].max(), delta[slices["right_ee"]].max())
-                logger.info(f"t={t} |target-state| max arm {arm:.3f} hand {hand:.3f} rad")
+                age = "?" if age_ms is None else f"{age_ms:.0f}"
+                logger.info(f"t={t} |target-state| max arm {arm:.3f} hand {hand:.3f} rad, "
+                            f"image age {age} ms")
             t += 1
             if args.max_steps is not None and t >= args.max_steps:
                 logger.info("max steps reached")
                 break
-            time.sleep(max(0.0, period - (time.time() - loop_start)))
+            wait_next_tick()
 
     except KeyboardInterrupt:
         pass
@@ -575,6 +628,8 @@ def run(args: argparse.Namespace) -> int:
                 attempt("close state reader", reader.close)
         if neck_state is not None:
             attempt("close neck state receiver", neck_state.close)
+        if clock_sync is not None:
+            attempt("close clock sync", clock_sync.close)
         if img_client is not None:
             attempt("close image client", img_client.close)
     return 0

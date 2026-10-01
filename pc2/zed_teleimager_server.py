@@ -4,6 +4,10 @@
 This is a compatibility launcher, not a second image protocol. It injects a
 ZED-backed head camera into teleimager and then reuses teleimager's existing
 ZMQ config service, JPEG publisher, and WebRTC publisher unchanged.
+
+Each ZMQ JPEG carries the frame's PC2 capture time in a comment segment, and a
+UDP clock-sync responder lets the Host convert it to its own clock (see
+PROTOCOL.md). Both are invisible to teleimager clients that ignore them.
 """
 
 from __future__ import annotations
@@ -19,8 +23,11 @@ import cv2
 import yaml
 
 try:
+    from .frame_timing import DEFAULT_SYNC_PORT, ClockSyncServer, stamp_jpeg
     from .zed_stereo import ZedCaptureOptions, ZedStereoCapture
 except ImportError:
+    from frame_timing import (  # type: ignore[no-redef]
+        DEFAULT_SYNC_PORT, ClockSyncServer, stamp_jpeg)
     from zed_stereo import ZedCaptureOptions, ZedStereoCapture  # type: ignore[no-redef]
 
 
@@ -34,7 +41,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--camera-id", type=int, default=None)
     parser.add_argument("--serial-number", type=int, default=None)
-    return parser.parse_args(argv)
+    parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT,
+                        help="UDP port answering Host clock-sync probes")
+    parser.add_argument("--no-clock-sync", action="store_true",
+                        help="do not run the clock-sync responder")
+    args = parser.parse_args(argv)
+    if not 1 <= args.clock_sync_port <= 65535:
+        parser.error("--clock-sync-port must be in 1..65535")
+    return args
 
 
 def load_and_validate_config(path: Path) -> tuple[dict[str, Any], ZedCaptureOptions]:
@@ -116,6 +130,7 @@ def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions):
             )
             self._capture = ZedStereoCapture(options)
             self._capture.open()
+            self._frame_sequence = 0
 
         def __str__(self) -> str:
             return (
@@ -131,7 +146,13 @@ def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions):
                 ok, encoded = cv2.imencode(".jpg", bgr)
                 if not ok:
                     raise RuntimeError("could not JPEG-encode the ZED stereo frame")
-                self._zmq_buffer.write(encoded.tobytes())
+                self._frame_sequence += 1
+                self._zmq_buffer.write(stamp_jpeg(
+                    encoded.tobytes(),
+                    self._frame_sequence,
+                    self._capture.latest_pc2_monotonic_ns,
+                    self._capture.latest_zed_image_time_ns,
+                ))
             self._ready.set()
 
         def release(self) -> None:
@@ -171,11 +192,18 @@ def run(args: argparse.Namespace) -> int:
 
     image_server.OpenCVCamera = make_zed_camera_class(image_server, options)
     image_server.CameraFinder = _ZedOnlyCameraFinder
-    server = image_server.ImageServer(config)
-    signal.signal(signal.SIGINT, partial(image_server.signal_handler, server))
-    signal.signal(signal.SIGTERM, partial(image_server.signal_handler, server))
-    server.start()
-    server.wait()
+    # Image capture and the neck process both use PC2 CLOCK_MONOTONIC, so one
+    # responder here serves image and neck timestamps alike.
+    clock_sync = None if args.no_clock_sync else ClockSyncServer(port=args.clock_sync_port)
+    try:
+        server = image_server.ImageServer(config)
+        signal.signal(signal.SIGINT, partial(image_server.signal_handler, server))
+        signal.signal(signal.SIGTERM, partial(image_server.signal_handler, server))
+        server.start()
+        server.wait()
+    finally:
+        if clock_sync is not None:
+            clock_sync.close()
     return 0
 
 

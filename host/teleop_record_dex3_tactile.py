@@ -13,7 +13,11 @@ additionally:
   pressure/temperature arrays in each item's ``tactiles`` field;
 - receives the neck state that PC2's head_pose_receiver sends back (UDP 5006)
   and records encoder yaw/pitch in states["neck"] and the commanded yaw/pitch
-  in actions["neck"].
+  in actions["neck"];
+- records per-item timing in states["timing"]: the Host monotonic sample time,
+  the ZED frame's PC2 capture time (stamped into the ZMQ JPEG) and its age, and
+  the neck command/encoder ages, using a Host/PC2 clock offset measured over
+  UDP (see host/frame_timing.py and PROTOCOL.md).
 
 Keys (sshkeyboard, same as xr_teleoperate):
   r: start following the operator   s: start/save an episode   q: quit
@@ -30,11 +34,16 @@ import time
 from typing import Any, Optional, Sequence
 
 try:
+    from .frame_timing import (DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader,
+                               frame_timing_entry)
     from .head_pose_udp import HeadPoseUdpSender
-    from .neck_state_receiver import NeckStateReceiver
+    from .neck_state_receiver import NeckStateReceiver, neck_record_entries
 except ImportError:
+    from frame_timing import (  # type: ignore[no-redef]
+        DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader, frame_timing_entry)
     from head_pose_udp import HeadPoseUdpSender  # type: ignore[no-redef]
-    from neck_state_receiver import NeckStateReceiver  # type: ignore[no-redef]
+    from neck_state_receiver import (  # type: ignore[no-redef]
+        NeckStateReceiver, neck_record_entries)
 
 
 DEX3_NUM_MOTORS = 7
@@ -67,6 +76,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--display-mode", choices=["immersive", "ego", "pass-through"],
                         default="immersive")
     parser.add_argument("--img-server-ip", default="192.168.123.164")
+    parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT,
+                        help="PC2 clock-sync UDP port (zed_teleimager_server.py)")
+    parser.add_argument("--no-clock-sync", action="store_true",
+                        help="do not probe the PC2 clock; timing ages are recorded as null")
     parser.add_argument("--network-interface", default=None,
                         help="DDS network interface, e.g. eth0")
     parser.add_argument("--motion", action="store_true",
@@ -79,7 +92,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--task-desc", default="task description")
     parser.add_argument("--task-steps", default="step1: do this; step2: do that;")
     args = parser.parse_args(argv)
-    for name in ("neck_pose_port", "neck_state_port"):
+    for name in ("neck_pose_port", "neck_state_port", "clock_sync_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be in 1..65535")
     return args
@@ -254,6 +267,25 @@ def build_states_actions(
 
 
 # ---------------------------------------------------------------------------
+# Episode timing summary
+# ---------------------------------------------------------------------------
+
+def summarize_ages(ages: Sequence[Optional[float]]) -> str:
+    """One log line on how stale the recorded images were."""
+
+    known = sorted(age for age in ages if age is not None)
+    missing = len(ages) - len(known)
+    if not known:
+        return f"image age unknown for all {len(ages)} items (no PC2 stamp or clock sync)"
+    median = known[len(known) // 2]
+    p95 = known[min(len(known) - 1, int(0.95 * len(known)))]
+    text = f"image age median {median:.1f} ms, p95 {p95:.1f} ms, max {known[-1]:.1f} ms"
+    if missing:
+        text += f", unknown for {missing}/{len(ages)} items"
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -301,6 +333,7 @@ def run(args: argparse.Namespace) -> int:
 
     keys = KeyState()
     img_client = None
+    clock_sync = None
     tv_wrapper = None
     neck = None
     neck_state = None
@@ -318,7 +351,11 @@ def run(args: argparse.Namespace) -> int:
         )
         keyboard_thread.start()
 
-        img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
+        # StampedFrameReader decodes the JPEG itself so image and stamp match.
+        img_client = ImageClient(host=args.img_server_ip, request_bgr=False)
+        head_frames = StampedFrameReader(img_client.get_head_frame)
+        if not args.no_clock_sync:
+            clock_sync = ClockSyncClient(args.img_server_ip, args.clock_sync_port)
         camera_config = img_client.get_cam_config()
         head_config = camera_config["head_camera"]
         if not head_config["binocular"]:
@@ -376,19 +413,23 @@ def run(args: argparse.Namespace) -> int:
         while not keys.start and not keys.stop:
             time.sleep(0.033)
             if head_config["enable_zmq"] and xr_need_local_img:
-                head_img = img_client.get_head_frame()
-                if head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                head_bgr = head_frames.read().bgr
+                if head_bgr is not None:
+                    tv_wrapper.render_to_xr(head_bgr)
 
         logger.info("Tracking started.")
         record_running = False
+        image_ages: list[Optional[float]] = []
         period = 1.0 / args.frequency
+        # Monotonic fixed-rate schedule: immune to wall-clock (NTP) steps, and
+        # sleep overshoot does not accumulate into a lower recording rate.
+        next_tick = time.monotonic()
         while not keys.stop:
-            loop_start = time.time()
-
+            frame = None
             head_bgr = None
             if head_config["enable_zmq"] and (args.record or xr_need_local_img):
-                head_bgr = img_client.get_head_frame().bgr
+                frame = head_frames.read()
+                head_bgr = frame.bgr
                 if xr_need_local_img and head_bgr is not None:
                     tv_wrapper.render_to_xr(head_bgr)
 
@@ -396,11 +437,17 @@ def run(args: argparse.Namespace) -> int:
                 keys.record_toggle = False
                 if not record_running:
                     record_running = recorder.create_episode()
+                    image_ages = []
                     if not record_running:
                         logger.error("Failed to create episode; recording not started.")
+                    elif clock_sync is not None and clock_sync.estimate() is None:
+                        logger.warning("No PC2 clock sync yet; image/neck ages will be null. "
+                                       "Is zed_teleimager_server.py running with UDP "
+                                       f"{args.clock_sync_port} reachable?")
                 else:
                     record_running = False
                     recorder.save_episode()
+                    logger.info(f"Episode timing: {summarize_ages(image_ages)}")
 
             tele_data = tv_wrapper.get_tele_data()
             with left_hand_pos_array.get_lock():
@@ -412,6 +459,7 @@ def run(args: argparse.Namespace) -> int:
 
             arm_q = arm_ctrl.get_current_dual_arm_q()
             arm_dq = arm_ctrl.get_current_dual_arm_dq()
+            sample_ns = time.monotonic_ns()
             sol_q, sol_tauff = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose,
                                                arm_q, arm_dq)
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
@@ -420,9 +468,15 @@ def run(args: argparse.Namespace) -> int:
                 with dual_hand_data_lock:
                     hand_state = list(dual_hand_state_array[:])
                     hand_action = list(dual_hand_action_array[:])
+                neck_latest = neck_state.latest()
                 states, actions = build_states_actions(arm_q, arm_dq, sol_q, sol_tauff,
                                                        hand_state, hand_action,
-                                                       neck_state.record_entries())
+                                                       neck_record_entries(*neck_latest))
+                states["timing"] = frame_timing_entry(
+                    sample_ns, frame,
+                    clock_sync.estimate() if clock_sync is not None else None,
+                    neck_latest[0])
+                image_ages.append(states["timing"]["image_age_ms"])
                 if head_bgr is not None:
                     colors = split_stereo(head_bgr, combined_width)
                 else:
@@ -431,7 +485,12 @@ def run(args: argparse.Namespace) -> int:
                 recorder.add_item(colors=colors, depths={}, states=states,
                                   actions=actions, tactiles=tactile.snapshot())
 
-            time.sleep(max(0.0, period - (time.time() - loop_start)))
+            next_tick += period
+            remaining = next_tick - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(remaining)
+            else:
+                next_tick = time.monotonic()  # overran: restart the schedule, no burst
 
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt, exiting.")
@@ -452,6 +511,8 @@ def run(args: argparse.Namespace) -> int:
             attempt("close neck forwarder", neck.close)
         if neck_state is not None:
             attempt("close neck state receiver", neck_state.close)
+        if clock_sync is not None:
+            attempt("close clock sync", clock_sync.close)
         if img_client is not None:
             attempt("close image client", img_client.close)
         if tv_wrapper is not None:

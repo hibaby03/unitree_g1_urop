@@ -80,3 +80,50 @@ Angles use the same convention as the commands: yaw is right positive and
 pitch is up positive, `angle = (count - center) × sign × 360 / 4096`. Invalid
 fields are sent as zero. Both timestamps are in the PC2 monotonic domain and
 must not be compared with Host clocks.
+
+# ZED frame stamp v1 (PC2 → Host, inside ZMQ JPEG)
+
+`pc2/zed_teleimager_server.py` inserts one JPEG comment segment directly after
+the SOI marker of every ZMQ frame. The Host parser is
+`host/frame_timing.py:parse_jpeg_stamp`; a frame without the segment is still a
+valid JPEG and is simply unstamped. Network byte order.
+
+```text
+FF D8 | FF FE | length=30 (uint16) | 28-byte payload | original JPEG after SOI
+```
+
+| Offset | Size | Type | Name | Description |
+| ---: | ---: | --- | --- | --- |
+| 0 | 4 | bytes | magic | ASCII `AFTS` |
+| 4 | 1 | uint8 | version | `1` |
+| 5 | 1 | uint8 | flags | Zero |
+| 6 | 2 | uint16 | reserved | Zero |
+| 8 | 4 | uint32 | frame_sequence | Increments once per ZMQ frame, wraps |
+| 12 | 8 | uint64 | capture_pc2_monotonic_ns | PC2 `time.monotonic_ns()` right after the ZED `grab()` |
+| 20 | 8 | uint64 | zed_image_time_ns | ZED SDK image timestamp, diagnostics only; `0` if unavailable |
+
+Python format string: `!4sBBHIQQ`
+
+# Clock sync v1 (Host ↔ PC2, UDP 5007)
+
+The Host sends a 20-byte request; PC2 answers with a 36-byte reply to the
+request's source address. All times are the sender's `time.monotonic_ns()`.
+Network byte order.
+
+Request `!4sBBHIQ`: magic `ACLK`, version `1`, flags `0`, reserved `0`,
+sequence, `host_send_ns` (t0).
+
+Reply `!4sBBHIQQQ`: the same magic/version/flags/reserved/sequence, echoed
+`host_send_ns` (t0), `pc2_receive_ns` (t1), `pc2_send_ns` (t2).
+
+With t3 the Host receive time:
+
+```text
+offset = ((t1 - t0) + (t2 - t3)) / 2     # PC2 monotonic - Host monotonic
+delay  = (t3 - t0) - (t2 - t1)
+host_time(pc2_ns) = pc2_ns - offset
+```
+
+The Host keeps the lowest-delay sample from roughly the last 8 seconds; its
+error is at most `delay / 2`. Replies whose sequence or echoed t0 do not match
+the outstanding request are discarded.

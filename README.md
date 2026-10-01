@@ -49,8 +49,10 @@ ZED Mini ─ USB 3 ─> PC2 PyZED ─> rectified left|right frame
   피드백 송신
 - `pc2/dynamixel_neck.py`: U2D2를 통한 두 축 DYNAMIXEL Sync Write / 엔코더 Sync Read
 - `pc2/neck_state_sender.py`: 목 명령/엔코더 상태 UDP packet 생성
+- `pc2/frame_timing.py` / `host/frame_timing.py`: ZMQ JPEG에 PC2 캡처 시각 삽입·해석,
+  Host↔PC2 monotonic clock offset 측정(UDP 5007), 녹화 item의 `states.timing` 생성
 - `PROTOCOL.md`: head-pose(48 byte, Host→PC2)와 neck-state(60 byte, PC2→Host)
-  UDP packet 규격
+  UDP packet, JPEG frame stamp, clock-sync packet 규격
 
 ZED 송신기는 별도 영상 프로토콜을 만들지 않는다. 최신 `xr_teleoperate`가 사용하는
 `teleimager.ImageClient`와 `TeleVuerWrapper`가 서버 설정을 그대로 읽는다.
@@ -293,6 +295,25 @@ python active_camera_host/teleop_record_dex3_tactile.py \
 | `tactiles.left_ee/right_ee` | Dex3-1 press sensor별 `pressure`[12], `temperature`[12], `lost`, 수신 후 경과 `age_ms` (한 번도 안 받았으면 `null`) |
 | `states.neck` | 엔코더 [yaw, pitch] `qpos`(rad), `position_counts`, `pc2_monotonic_ns`, `age_ms` |
 | `actions.neck` | 명령 [yaw, pitch] `qpos`(rad), goal `position_counts`, `pc2_monotonic_ns`, `pose_sequence`, `torque_enabled`, `age_ms` |
+| `states.timing` | item 시각과 관측 지연. 아래 표 참고 |
+
+`states.timing` (시각은 모두 ns, 지연은 ms, 모를 때는 `null`):
+
+| 키 | 내용 |
+| --- | --- |
+| `host_monotonic_ns` | 팔 q를 읽은 직후의 Host `time.monotonic_ns()` (item 기준 시각) |
+| `image_frame_sequence` | PC2가 붙인 ZED frame 번호. 연속 item에서 같으면 같은 영상이 재사용된 것 |
+| `image_pc2_monotonic_ns` | ZED `grab()` 직후 PC2 monotonic 시각 |
+| `image_host_monotonic_ns` | 위 시각을 Host clock으로 옮긴 값 |
+| `image_age_ms` | item 기준 시각에 영상이 얼마나 오래됐는지 (캡처 + JPEG + 전송 + 대기) |
+| `neck_present_age_ms` / `neck_command_age_ms` | 같은 기준의 목 엔코더 / 명령 지연 |
+| `clock_offset_ns` / `clock_uncertainty_ms` | PC2 − Host clock offset과 그 오차 상한(가장 빠른 probe의 RTT/2) |
+
+녹화 루프는 monotonic clock의 고정 주기 스케줄로 돈다. 루프가 늦어지면 누적해서
+따라잡지 않고 다시 시작하므로, 실제 간격은 `host_monotonic_ns` 차이로 확인한다.
+episode를 저장할 때 영상 지연의 median/p95/max가 로그에 찍힌다.
+clock sync는 PC2 `zed_teleimager_server.py`가 UDP 5007로 응답하며, 응답이 없으면
+경고 후 지연 값만 `null`로 녹화한다(`--clock-sync-port`, `--no-clock-sync`).
 
 목 yaw는 오른쪽, pitch는 위가 양수이며 center(기본 2048) 기준이다. Host는 녹화
 시점에 가장 최근 packet을 넣으므로, 더 정밀한 정렬이 필요하면 `pc2_monotonic_ns`로
@@ -413,9 +434,11 @@ python active_camera_host/deploy_act.py \
    0 자세로 거의 순간 이동한다. 종료 시 `ctrl_dual_arm_go_home`도 같은 속도다.
    녹화 스크립트와 upstream teleop도 동일하게 동작한다.
    - 우회: 로봇을 매단 상태에서 팔 주변을 비우고 실행한다.
-3. **센서가 끊겨도 마지막 값으로 계속 제어한다 (가능성).** 팔/손 state의 수신 시각을
-   검사하지 않는다. ZED 영상도 `get_head_frame()`이 마지막 프레임을 계속 돌려주면
-   끊김을 감지하지 못한다.
+3. **팔/손 센서가 끊겨도 마지막 값으로 계속 제어한다 (가능성).** 팔/손 state의 수신
+   시각을 검사하지 않는다. ZED 영상은 PC2 캡처 시각 기준 지연이
+   `--max-image-age-ms`(기본 200)를 넘으면 policy에 넣지 않고 마지막 명령을
+   유지한다. 단, clock sync가 없으면(구버전 PC2 서버, UDP 5007 차단) 영상 끊김도
+   감지하지 못하고 시작 시 경고만 한다.
 4. **`--query-every`가 chunk 크기보다 크면 IndexError (확인됨).** `--no-temporal-agg`와
    함께 쓸 때만 해당한다. chunk 크기 이하로 준다.
 
@@ -430,13 +453,23 @@ python active_camera_host/deploy_act.py \
    `round(n × val_ratio)`가 0이 되어 val 세트가 없기 때문이다. 이때는
    `policy_last.ckpt`를 쓴다.
 
-## PC2 clock 동기화 원칙
+## Host/PC2 clock 동기화
 
-카메라와 두 목 모터가 모두 PC2에 연결되므로, 향후 dataset 동기화의 canonical
-clock은 PC2의 `time.monotonic_ns()`로 통일한다. Host wall clock이나 UDP packet의
-Unix timestamp를 sensor alignment 기준으로 사용하지 않는다.
+카메라와 두 목 모터는 PC2에, 팔·손·tactile은 Host(DDS)에 있다. 두 PC의 clock은
+서로 비교할 수 없으므로 다음 원칙을 따른다.
 
-현재 기본 세팅은 다음 timestamp 기반을 준비한다.
+- 각 PC 안에서는 `time.monotonic_ns()`만 쓴다. wall clock(`time.time()`)과 UDP
+  packet의 Unix timestamp는 NTP 보정으로 튈 수 있어 정렬 기준으로 쓰지 않는다.
+- PC2 시각은 Host가 측정한 offset(PC2 − Host)으로 Host monotonic clock에 옮긴다.
+  Host는 0.25초마다 NTP 방식 probe를 PC2 `zed_teleimager_server.py`(UDP 5007)에
+  보내고, 최근 약 8초 안에서 RTT가 가장 짧은 probe의 offset을 쓴다. 비대칭 지연에
+  의한 오차는 그 RTT의 절반 이하이며 `clock_uncertainty_ms`로 기록된다. 유선
+  LAN에서는 보통 1 ms 미만이다. 창을 짧게 두어 두 PC clock의 drift(수십 ppm)도
+  무시할 수준으로 유지한다.
+- ZED와 목 프로세스는 같은 PC2 `CLOCK_MONOTONIC`을 쓰므로 ZED 서버의 응답기 하나로
+  영상과 목 timestamp를 모두 변환한다. chrony/NTP 설정은 필요 없다.
+
+PC2가 남기는 timestamp:
 
 - ZED: 한 번의 성공한 `grab()` 직후 `latest_pc2_monotonic_ns` 기록
 - ZED SDK image timestamp: `latest_zed_image_time_ns`에 진단용으로 별도 보존
@@ -446,10 +479,18 @@ Unix timestamp를 sensor alignment 기준으로 사용하지 않는다.
 - encoder: Present Position Sync Read 직전 PC2 monotonic timestamp를 neck-state
   packet(`present_pc2_monotonic_ns`)에 기록
 
-녹화 스크립트는 두 목 timestamp를 `states.neck`/`actions.neck.pc2_monotonic_ns`로
-episode에 남긴다. ZED frame의 PC2 timestamp는 아직 ZMQ JPEG stream으로 Host에 전달되지
-않으므로, episode 안에서 image와 목 값은 Host 녹화 시점 기준의 최신값끼리 묶인다.
-frame/state resampling은 아직 구현하지 않았다.
+- ZED frame: 위 `grab()` 시각과 frame 번호를 ZMQ JPEG의 COM segment에 넣어 Host로
+  보낸다. JPEG decoder는 COM segment를 무시하므로 teleimager/WebRTC/Quest와
+  기존 `xr_teleoperate` 녹화는 영향이 없다.
+
+녹화 스크립트는 이 값들을 `states.timing`(4-1절)에 Host clock 기준으로 남긴다.
+episode의 한 item은 여전히 "item 시각의 최신값"끼리 묶이지만, 각 관측의 실제 지연이
+기록되므로 학습 시 지연이 큰 frame을 거르거나 state를 영상 시각으로 보간할 수 있다.
+frame/state resampling 자체는 아직 구현하지 않았다.
+
+Host는 영상 JPEG를 직접 decode한다(`ImageClient(request_bgr=False)`).
+teleimager의 BGR decoder는 별도 스레드라 `.bgr`가 `.jpg`보다 한 frame 늦을 수
+있어서, 영상과 stamp가 같은 frame임을 보장하기 위해서다.
 
 ## 포트
 
@@ -459,6 +500,7 @@ frame/state resampling은 아직 구현하지 않았다.
 - `55555/TCP`: 녹화용 stereo JPEG ZMQ stream
 - `5005/UDP`: Host에서 PC2로 보내는 head pose
 - `5006/UDP`: PC2에서 Host로 돌려보내는 목 명령/엔코더 yaw·pitch
+- `5007/UDP`: Host→PC2 clock-sync probe와 응답 (`zed_teleimager_server.py`)
 
 ## 테스트
 
@@ -468,7 +510,8 @@ python3 -m unittest discover -s tests -v
 ```
 
 테스트는 packet, matrix/quaternion, yaw/pitch, motor position 변환, 엔코더 Sync Read,
-neck-state packet 왕복·UDP 수신, Dex3-1 tactile 변환, 녹화 state/action 배치와 함께
+neck-state packet 왕복·UDP 수신, JPEG frame stamp·clock offset 계산과 loopback clock
+sync, Dex3-1 tactile 변환, 녹화 state/action 배치와 함께
 ZED 좌우 배치 및 active-stereo-only 설정 검증을 수행한다. 하드웨어와
 xr_teleoperate 없이 가짜 SDK/DDS 객체로 실행된다. `test_zed_stereo`는 `numpy`가
 필요하다. ZED/Quest/U2D2 실기
