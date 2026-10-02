@@ -41,6 +41,8 @@ ZED Mini ─ USB 3 ─> PC2 PyZED ─> rectified left|right frame
 - `host/run_teleop_with_neck.py`: 기존 teleop 실행과 동시에 raw OpenXR head pose 송신
 - `host/teleop_record_dex3_tactile.py`: G1_29 + Dex3-1 teleop 루프. head pose 송신과
   함께 팔·손·Dex3-1 tactile·목 yaw/pitch를 episode에 녹화
+- `host/zmq_stereo_vr.py`: Host가 ZMQ로 받은 ZED 영상을 Vuer로 Quest 양안에 표시하는
+  독립 뷰어. 선택적으로 목 추종(3-2절)
 - `host/head_pose_udp.py`: OpenXR matrix 검증, quaternion 변환, UDP packet 생성
 - `host/neck_state_receiver.py`: PC2가 보낸 목 명령/엔코더 packet 수신과 녹화용 변환
 - `host/keyboard_2xl430.py`: Windows에서 2XL430 두 축을 키보드로 움직이는 확인용 도구
@@ -218,6 +220,40 @@ Quest 자체 추적 품질을 별도로 판정하지는 않는다.
 
 기존 `--video-only`는 계속 영상만 표시하며 머리 자세 UDP를 보내지 않는다.
 `--input-mode=hand` / `controller` 및 입력 모드 생략은 기존 전체 teleop 경로다.
+
+## 3-2. Host가 받은 영상을 Quest로 보기 (`zmq_stereo_vr.py`)
+
+3-1절은 Quest가 PC2의 WebRTC를 직접 재생한다. 이 뷰어는 녹화 경로와 같은
+PC2 ZMQ JPEG(55555)를 Host가 받아 decode한 뒤 Vuer `ImageBackground`의 왼쪽/오른쪽
+눈 레이어(`layers=1/2`)로 보낸다. 따라서 Quest에서 보는 영상이 녹화되는 영상과
+같다. xr_teleoperate의 TeleVuer, DDS, IK, 녹화기는 띄우지 않으므로 G1 없이 돌릴 수
+있고, legacy TeleVuer 버전이나 Linux `fork` 제약도 받지 않는다. 필요한 패키지는
+`vuer[all]`, `pyzmq`, `opencv-python`, `numpy`이며 xr_teleoperate의 `tv` 환경에 이미 있다.
+
+```bash
+# PC2
+python3 pc2/zed_teleimager_server.py
+
+# Host (영상만)
+python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.123.164
+
+# Host (영상 + 목 추종, PC2에서 head_pose_receiver.py 실행)
+python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.123.164 \
+  --neck-pose-ip 192.168.123.164
+```
+
+Quest 브라우저에서 기존과 같은 `https://192.168.123.2:8012/?ws=wss://192.168.123.2:8012`로
+접속한다. 인증서는 `--cert/--key`, `XR_TELEOP_CERT/KEY`, `~/.config/xr_teleoperate/` 순으로
+찾는다. 2초마다 수신/송신 fps와 영상 지연(PC2 캡처 → Host 시점, clock sync 필요)이
+출력된다. Quest 화면까지의 지연은 여기에 Vuer JPEG 재인코딩과 Wi-Fi 전송이 더해진다.
+
+- Vuer 서버가 8012를 쓰므로 teleop/녹화 스크립트와 동시에 실행하지 않는다.
+- `--neck-pose-ip`를 주면 `CAMERA_MOVE`를 head-pose packet으로 PC2에 보낸다.
+  250 ms 이상 새 pose가 없으면 송신을 멈추므로 Quest가 끊기면 PC2 watchdog이
+  토크를 끈다(3-1절과 같은 규칙). 데스크톱 브라우저로 같은 주소에 접속해 시점을
+  돌리면 그 카메라 이동도 head pose로 들어가므로, 목 추종 중에는 Quest만 접속한다.
+- 화면 크기/거리는 `--distance`(기본 1 m), 화질은 `--jpeg-quality`(기본 80),
+  표시 주기는 `--display-fps`(기본 30)로 조정한다. 같은 frame은 다시 보내지 않는다.
 
 ## 4. Host teleoperation과 episode 기록
 
@@ -511,7 +547,7 @@ python3 -m unittest discover -s tests -v
 
 테스트는 packet, matrix/quaternion, yaw/pitch, motor position 변환, 엔코더 Sync Read,
 neck-state packet 왕복·UDP 수신, JPEG frame stamp·clock offset 계산과 loopback clock
-sync, Dex3-1 tactile 변환, 녹화 state/action 배치와 함께
+sync, ZMQ→Vuer 뷰어의 양안 분할·head pose 전달, Dex3-1 tactile 변환, 녹화 state/action 배치와 함께
 ZED 좌우 배치 및 active-stereo-only 설정 검증을 수행한다. 하드웨어와
 xr_teleoperate 없이 가짜 SDK/DDS 객체로 실행된다. `test_zed_stereo`는 `numpy`가
 필요하다. ZED/Quest/U2D2 실기
