@@ -143,8 +143,8 @@ python3 pc2/head_pose_receiver.py --bind 0.0.0.0 --port 5005
 python3 pc2/head_pose_receiver.py \
   --bind 0.0.0.0 --port 5005 \
   --enable-motor \
-  --dxl-device /dev/ttyUSB0 --dxl-baudrate 1000000 \
-  --yaw-id 1 --pitch-id 2 \
+  --dxl-device /dev/ttyUSB0 --dxl-baudrate 57600 \
+  --yaw-id 5 --pitch-id 6 \
   --yaw-center 2048 --pitch-center 2048 \
   --yaw-sign 1 --pitch-sign 1 \
   --yaw-limit-deg 80 \
@@ -157,9 +157,9 @@ python3 pc2/head_pose_receiver.py \
 오른쪽/위로 10°면 2048 + 114, 왼쪽/아래로 10°면 2048 − 114 count가 된다. 방향이
 반대면 `--yaw-sign -1` 또는 `--pitch-sign -1`을 준다.
 
-`--yaw-id`/`--pitch-id`/`--dxl-baudrate`는 실제 모터 설정과 같아야 한다.
-`host/keyboard_2xl430.py`의 기본값(ID 5/6, 57600 bps)은 이 receiver의 기본값
-(ID 1/2, 1,000,000 bps)과 다르므로, 키보드 도구로 확인한 값을 그대로 넣는다.
+`--yaw-id`/`--pitch-id`/`--dxl-baudrate`는 실제 모터 설정과 같아야 한다. 기본값은
+실측값(ID 5/6, 57600 bps)이며 `host/keyboard_2xl430.py`와 같다. 모터 ID/baudrate를
+모를 때는 DYNAMIXEL SDK의 `ping`으로 여러 baudrate를 훑어 확인한 뒤 그대로 넣는다.
 
 U2D2 USB만으로 모터 전원을 공급하지 말고 2XL430용 외부 전원을 사용한다.
 

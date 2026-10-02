@@ -142,7 +142,7 @@ class DynamixelNeckTests(unittest.TestCase):
     def test_connect_and_sync_write_both_axes(self):
         sdk = FakeSdk()
         neck = DynamixelNeck(
-            NeckConfiguration(yaw_sign=1, pitch_sign=-1),
+            NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2, yaw_sign=1, pitch_sign=-1),
             sdk_module=sdk,
         )
 
@@ -168,7 +168,7 @@ class DynamixelNeckTests(unittest.TestCase):
     def test_read_present_angles_uses_center_and_sign(self):
         sdk = FakeSdk()
         neck = DynamixelNeck(
-            NeckConfiguration(yaw_sign=1, pitch_sign=-1),
+            NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2, yaw_sign=1, pitch_sign=-1),
             sdk_module=sdk,
         )
         neck.connect()
@@ -183,7 +183,7 @@ class DynamixelNeckTests(unittest.TestCase):
 
     def test_present_position_is_signed(self):
         sdk = FakeSdk()
-        neck = DynamixelNeck(NeckConfiguration(), sdk_module=sdk)
+        neck = DynamixelNeck(NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2), sdk_module=sdk)
         neck.connect()
         sdk.sync_read.present = {1: -5, 2: 10}
 
@@ -191,7 +191,7 @@ class DynamixelNeckTests(unittest.TestCase):
 
     def test_sync_read_failure_raises(self):
         sdk = FakeSdk()
-        neck = DynamixelNeck(NeckConfiguration(), sdk_module=sdk)
+        neck = DynamixelNeck(NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2), sdk_module=sdk)
         neck.connect()
         sdk.sync_read.result = 1
         with self.assertRaises(DynamixelNeckError):
@@ -204,3 +204,14 @@ class DynamixelNeckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeadPoseReceiverDefaultsTests(unittest.TestCase):
+    def test_motor_defaults_match_measured_hardware(self):
+        from pc2.head_pose_receiver import parse_args
+
+        args = parse_args(["--enable-motor"])
+        self.assertEqual(args.dxl_device, "/dev/ttyUSB0")
+        self.assertEqual(args.dxl_baudrate, 57600)
+        self.assertEqual(args.yaw_id, 5)
+        self.assertEqual(args.pitch_id, 6)

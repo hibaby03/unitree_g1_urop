@@ -64,9 +64,9 @@ def position_to_angle(
 @dataclass(frozen=True)
 class NeckConfiguration:
     device: str = "/dev/ttyUSB0"
-    baudrate: int = 1_000_000
-    yaw_id: int = 1
-    pitch_id: int = 2
+    baudrate: int = 57600
+    yaw_id: int = 5
+    pitch_id: int = 6
     yaw_center: int = 2048
     pitch_center: int = 2048
     yaw_sign: int = 1

@@ -112,9 +112,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="actually enable torque and write goals; omitted means monitor-only",
     )
     motor.add_argument("--dxl-device", default="/dev/ttyUSB0")
-    motor.add_argument("--dxl-baudrate", type=int, default=1_000_000)
-    motor.add_argument("--yaw-id", type=int, default=1)
-    motor.add_argument("--pitch-id", type=int, default=2)
+    motor.add_argument("--dxl-baudrate", type=int, default=57600)
+    motor.add_argument("--yaw-id", type=int, default=5)
+    motor.add_argument("--pitch-id", type=int, default=6)
     motor.add_argument("--yaw-center", type=int, default=2048)
     motor.add_argument("--pitch-center", type=int, default=2048)
     motor.add_argument("--yaw-sign", type=direction_sign, default=1)
