@@ -1,5 +1,37 @@
 # xr_teleoperate + ZED Mini 2-DoF active stereo camera
 
+## 빠른 실행 (영상 + 목 추종)
+
+현재 네트워크: Host `192.168.50.3`, 로봇/PC2 `192.168.50.9`. 아래 기본값에
+이미 반영돼 있어 주소를 따로 넣지 않는다.
+
+```bash
+# --- PC2 (로봇) 터미널 1: ZED stereo 영상 서버 ---
+python3 pc2/zed_teleimager_server.py
+
+# --- PC2 (로봇) 터미널 2: 목 모터 (처음엔 15도 제한으로 안전하게) ---
+python3 pc2/head_pose_receiver.py --bind 0.0.0.0 --port 5005 --enable-motor \
+  --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15 \
+  --motor-timeout-ms 60000
+
+# --- Host 터미널: Quest 화면 + 목 추종 ---
+python active_camera_host/zmq_stereo_vr.py
+```
+
+그다음 Quest 브라우저에서 접속하고 **Enter VR**:
+
+```text
+https://192.168.50.3:8012/?ws=wss://192.168.50.3:8012
+```
+
+- 정면을 본 상태에서 목 수신기를 켜면 그 자세가 중립이 된다.
+- 영상만 보고 목은 끄려면 Host에서 `--no-neck`.
+- 목 방향이 반대면 PC2 수신기에 `--yaw-sign`/`--pitch-sign`을 뒤집는다(기본 yaw -1, pitch +1).
+- 녹화까지 하려면 4절 `teleop_record_dex3_tactile.py`, 학습된 정책 실행은 5절 `deploy_act.py`.
+- 자주 쓰는 설치·확인·문제 해결은 아래 각 절에 있다.
+
+---
+
 Unity 없이 Unitree `xr_teleoperate`의 기존 영상/녹화 파이프라인을 그대로
 사용하면서, G1 기본 카메라 입력을 목에 장착된 ZED Mini stereo로 교체한다.
 
