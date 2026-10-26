@@ -34,7 +34,10 @@ class ArgsTests(unittest.TestCase):
         args = viewer.parse_args([])
         self.assertEqual(args.img_server_ip, "192.168.50.9")
         self.assertEqual(args.zmq_port, 55555)
-        self.assertIsNone(args.neck_pose_ip)
+        self.assertEqual(args.neck_pose_ip, "192.168.50.9")
+
+    def test_no_neck_disables_forwarding(self):
+        self.assertIsNone(viewer.parse_args(["--no-neck"]).neck_pose_ip)
 
     def test_rejects_bad_values(self):
         for argv in (["--zmq-port", "0"], ["--jpeg-quality", "0"], ["--distance", "0"]):

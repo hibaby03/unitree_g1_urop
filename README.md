@@ -234,13 +234,15 @@ PC2 ZMQ JPEG(55555)를 Host가 받아 decode한 뒤 Vuer `ImageBackground`의 �
 # PC2
 python3 pc2/zed_teleimager_server.py
 
-# Host (영상만)
-python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.50.9
+# Host (영상 + 목 추종; PC2에서 head_pose_receiver.py도 실행)
+python active_camera_host/zmq_stereo_vr.py
 
-# Host (영상 + 목 추종, PC2에서 head_pose_receiver.py 실행)
-python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.50.9 \
-  --neck-pose-ip 192.168.50.9
+# Host (영상만, 목은 안 움직임)
+python active_camera_host/zmq_stereo_vr.py --no-neck
 ```
+
+`--img-server-ip`와 `--neck-pose-ip`의 기본값은 로봇 주소(192.168.50.9)이므로
+보통 옵션 없이 실행한다. 영상만 보려면 `--no-neck`, 주소가 다르면 각 옵션으로 덮어쓴다.
 
 Quest 브라우저에서 기존과 같은 `https://192.168.50.3:8012/?ws=wss://192.168.50.3:8012`로
 접속한다. 인증서는 `--cert/--key`, `XR_TELEOP_CERT/KEY`, `~/.config/xr_teleoperate/` 순으로

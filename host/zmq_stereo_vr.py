@@ -62,14 +62,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "~/.config/xr_teleoperate/cert.pem")
     parser.add_argument("--key", help="TLS key; default XR_TELEOP_KEY or "
                         "~/.config/xr_teleoperate/key.pem")
-    parser.add_argument("--neck-pose-ip", default=None,
-                        help="forward the Quest head pose to PC2 (e.g. 192.168.50.9)")
+    parser.add_argument("--neck-pose-ip", default="192.168.50.9",
+                        help="forward the Quest head pose to PC2 at this address")
+    parser.add_argument("--no-neck", action="store_true",
+                        help="display video only; do not forward the head pose to PC2")
     parser.add_argument("--neck-pose-port", type=int, default=5005)
     parser.add_argument("--neck-pose-rate", type=positive_rate, default=60.0)
     parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT)
     parser.add_argument("--no-clock-sync", action="store_true",
                         help="do not measure the image age")
     args = parser.parse_args(argv)
+    if args.no_neck:
+        args.neck_pose_ip = None
     for name in ("zmq_port", "neck_pose_port", "clock_sync_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be in 1..65535")
