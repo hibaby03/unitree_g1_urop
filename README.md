@@ -10,9 +10,8 @@
 python3 pc2/zed_teleimager_server.py
 
 # --- PC2 (로봇) 터미널 2: 목 모터 (처음엔 15도 제한으로 안전하게) ---
-python3 pc2/head_pose_receiver.py --bind 0.0.0.0 --port 5005 --enable-motor \
-  --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15 \
-  --motor-timeout-ms 60000
+python3 pc2/head_pose_receiver.py --enable-motor \
+  --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
 
 # --- Host 터미널: Quest 화면 + 목 추종 ---
 python active_camera_host/zmq_stereo_vr.py
@@ -244,11 +243,11 @@ python active_camera_host/run_teleop_with_neck.py \
 주소는 각각 `--video-offer-url`, `--neck-pose-ip`로 지정한다.
 
 새 `CAMERA_MOVE`가 250 ms 이상 들어오지 않으면 머리 자세 송신을 멈춘다.
-PC2는 마지막 정상 패킷 이후 기존 `--motor-timeout-ms`(기본 1000 ms)가 지나면
-토크를 끄고 종료한다. 정상 자세가 한 번도 오지 않은 경우도 PC2 시작 시점부터
-타임아웃을 적용하므로 Host/Quest를 먼저 준비한다. 타임아웃 후에는 PC2 목
-수신기를 다시 실행해야 한다. 이 검사는 이벤트 수신 중단을 감지하며,
-Quest 자체 추적 품질을 별도로 판정하지는 않는다.
+PC2는 첫 정상 pose가 들어온 뒤부터 watchdog을 적용해, 이후 마지막 정상 패킷에서
+`--motor-timeout-ms`(기본 1000 ms)가 지나면 토크를 끄고 종료한다. 첫 pose가 오기
+전에는 토크를 켠 채 무한정 기다리므로(현재 자세 유지), 목 수신기를 먼저 켜고
+Host/Quest를 나중에 준비해도 된다. 타임아웃 후에는 PC2 목 수신기를 다시 실행한다.
+이 검사는 이벤트 수신 중단을 감지하며, Quest 자체 추적 품질을 별도로 판정하지는 않는다.
 
 기존 `--video-only`는 계속 영상만 표시하며 머리 자세 UDP를 보내지 않는다.
 `--input-mode=hand` / `controller` 및 입력 모드 생략은 기존 전체 teleop 경로다.
@@ -490,14 +489,11 @@ python active_camera_host/deploy_act.py \
 
 **`host/deploy_act.py`**
 
-1. **PC2 목 receiver가 먼저 종료된다 (확인됨).** `head_pose_receiver.py --enable-motor`는
-   시작 후 `--motor-timeout-ms`(기본 1000 ms) 안에 pose가 오지 않으면 토크를 끄고
-   종료한다. deploy는 `r`을 누른 뒤에야 목 packet을 보내므로 README 순서대로 PC2를
-   먼저 켜면 receiver가 이미 죽어 있고, `r` 후 3초 뒤 "no arm/hand/neck state"로
-   멈춘다.
-   - 우회: PC2 receiver에 `--motor-timeout-ms`를 충분히 크게 준다(예: 60000). 이
-     값은 통신이 끊겼을 때 토크를 끄는 watchdog이기도 하므로 실행 중에는 목을 계속
-     지켜본다.
+1. **PC2 목 receiver 시작 타임아웃 (해결됨).** 예전에는 `head_pose_receiver.py
+   --enable-motor`가 시작 후 `--motor-timeout-ms` 안에 pose가 안 오면 바로 종료해서,
+   `r` 전에는 packet을 안 보내는 deploy와 순서가 안 맞았다. 지금은 첫 pose가 오기
+   전에는 토크를 켠 채 무한정 기다리므로 PC2를 먼저 켜도 된다. watchdog은 첫 pose
+   이후에만 동작한다.
 2. **실행 직후 팔이 0 자세로 빠르게 이동한다 (확인됨).** upstream
    `G1_29_ArmController`는 `q_target = zeros(14)`로 생성되고 250 Hz 제어 스레드를
    바로 시작하며, 속도 제한은 30 rad/s다. 따라서 dry-run이 아니면 `r` 전부터 팔이

@@ -187,7 +187,6 @@ def run(args: argparse.Namespace) -> int:
     stale_reported = False
     print_period = 1.0 / args.print_rate
     timeout_seconds = args.timeout_ms / 1000.0
-    motor_watchdog_start = time.monotonic() if neck is not None else None
 
     try:
         while True:
@@ -206,14 +205,11 @@ def run(args: argparse.Namespace) -> int:
                 )
                 stale_reported = True
 
-            if neck is not None:
-                watchdog_reference = (
-                    last_valid_monotonic
-                    if last_valid_monotonic is not None
-                    else motor_watchdog_start
-                )
-                assert watchdog_reference is not None
-                if now - watchdog_reference >= args.motor_timeout_ms / 1000.0:
+            # Only guard an established stream: wait indefinitely for the first
+            # pose (torque stays on, holding position), then torque off and exit
+            # if the stream stops for motor_timeout_ms.
+            if neck is not None and last_valid_monotonic is not None:
+                if now - last_valid_monotonic >= args.motor_timeout_ms / 1000.0:
                     print(
                         json.dumps(
                             {
