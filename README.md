@@ -146,16 +146,16 @@ python3 pc2/head_pose_receiver.py \
   --dxl-device /dev/ttyUSB0 --dxl-baudrate 57600 \
   --yaw-id 5 --pitch-id 6 \
   --yaw-center 2048 --pitch-center 2048 \
-  --yaw-sign 1 --pitch-sign 1 \
+  --yaw-sign -1 --pitch-sign 1 \
   --yaw-limit-deg 80 \
   --pitch-down-limit-deg 35 --pitch-up-limit-deg 45 \
   --smoothing 1.0 \
   --motor-timeout-ms 1000
 ```
 
-모터 위치는 `center + sign × 각도 × 4096/360`이다. 기본 center는 2048이므로
-오른쪽/위로 10°면 2048 + 114, 왼쪽/아래로 10°면 2048 − 114 count가 된다. 방향이
-반대면 `--yaw-sign -1` 또는 `--pitch-sign -1`을 준다.
+모터 위치는 `center + sign × 각도 × 4096/360`이다. 기본 center는 2048이다. 기본
+sign은 이 로봇의 실측 배선(yaw -1, pitch +1)이며, 방향이 반대로 움직이면
+`--yaw-sign`/`--pitch-sign`을 뒤집는다.
 
 `--yaw-id`/`--pitch-id`/`--dxl-baudrate`는 실제 모터 설정과 같아야 한다. 기본값은
 실측값(ID 5/6, 57600 bps)이며 `host/keyboard_2xl430.py`와 같다. 모터 ID/baudrate를

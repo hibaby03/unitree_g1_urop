@@ -69,7 +69,7 @@ class NeckConfiguration:
     pitch_id: int = 6
     yaw_center: int = 2048
     pitch_center: int = 2048
-    yaw_sign: int = 1
+    yaw_sign: int = -1
     pitch_sign: int = 1
     profile_velocity: int = 180
     profile_acceleration: int = 60

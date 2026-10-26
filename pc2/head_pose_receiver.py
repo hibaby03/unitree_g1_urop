@@ -117,7 +117,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     motor.add_argument("--pitch-id", type=int, default=6)
     motor.add_argument("--yaw-center", type=int, default=2048)
     motor.add_argument("--pitch-center", type=int, default=2048)
-    motor.add_argument("--yaw-sign", type=direction_sign, default=1)
+    motor.add_argument("--yaw-sign", type=direction_sign, default=-1)
     motor.add_argument("--pitch-sign", type=direction_sign, default=1)
     motor.add_argument("--profile-velocity", type=int, default=180)
     motor.add_argument("--profile-acceleration", type=int, default=60)

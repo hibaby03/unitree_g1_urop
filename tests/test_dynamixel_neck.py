@@ -215,3 +215,5 @@ class HeadPoseReceiverDefaultsTests(unittest.TestCase):
         self.assertEqual(args.dxl_baudrate, 57600)
         self.assertEqual(args.yaw_id, 5)
         self.assertEqual(args.pitch_id, 6)
+        self.assertEqual(args.yaw_sign, -1)
+        self.assertEqual(args.pitch_sign, 1)
