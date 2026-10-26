@@ -33,7 +33,7 @@ def parse_launcher_args(
         default="~/hckang/xr_teleoperate",
         help="xr_teleoperate repository root",
     )
-    parser.add_argument("--neck-pose-ip", default="192.168.123.164")
+    parser.add_argument("--neck-pose-ip", default="192.168.50.9")
     parser.add_argument("--neck-pose-port", type=int, default=5005)
     parser.add_argument("--neck-pose-rate", type=positive_rate, default=60.0)
     parser.add_argument(
@@ -45,7 +45,7 @@ def parse_launcher_args(
         help="Display PC2 stereo video without robot control, pose UDP, or recording",
     )
     parser.add_argument(
-        "--video-offer-url", default="https://192.168.123.164:60001/offer",
+        "--video-offer-url", default="https://192.168.50.9:60001/offer",
         help="PC2 HTTPS WebRTC offer endpoint (video-only or input-mode=none)",
     )
     parser.add_argument("--video-cert", help="Host TLS certificate; or XR_TELEOP_CERT")

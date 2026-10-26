@@ -83,7 +83,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="train_act.py that defines the ACT model")
     parser.add_argument("--xr-repo", default="~/hckang/xr_teleoperate",
                         help="xr_teleoperate repository root")
-    parser.add_argument("--img-server-ip", default="192.168.123.164")
+    parser.add_argument("--img-server-ip", default="192.168.50.9")
     parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT,
                         help="PC2 clock-sync UDP port (zed_teleimager_server.py)")
     parser.add_argument("--no-clock-sync", action="store_true",
@@ -94,7 +94,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="DDS network interface, e.g. eth0")
     parser.add_argument("--motion", action="store_true",
                         help="robot is in motion (locomotion) mode; skip entering debug mode")
-    parser.add_argument("--neck-pose-ip", default="192.168.123.164")
+    parser.add_argument("--neck-pose-ip", default="192.168.50.9")
     parser.add_argument("--neck-pose-port", type=int, default=5005)
     parser.add_argument("--neck-pose-rate", type=positive_float, default=60.0)
     parser.add_argument("--neck-state-bind", default="0.0.0.0")

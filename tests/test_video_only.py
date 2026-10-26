@@ -109,7 +109,7 @@ class VideoOnlyTests(unittest.TestCase):
                         await viewer.main_image_webrtc(session)
                 session.upsert.assert_called_once()
                 node = session.upsert.call_args.args[0]
-                self.assertEqual(node["src"], "https://192.168.123.164:60001/offer")
+                self.assertEqual(node["src"], "https://192.168.50.9:60001/offer")
                 self.assertEqual(node["aspect"], 1280 / 720)
                 self.assertEqual(node["iceServer"], {})
                 self.assertNotIn("layers", node)

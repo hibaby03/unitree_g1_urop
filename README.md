@@ -120,7 +120,7 @@ python3 pc2/zed_teleimager_server.py --serial-number 12345678
 Quest를 연결하기 전에 다음 주소에서 WebRTC 영상이 좌우로 붙어 나오는지 확인한다.
 
 ```text
-https://192.168.123.164:60001
+https://192.168.50.9:60001
 ```
 
 화면의 왼쪽 절반이 ZED LEFT, 오른쪽 절반이 ZED RIGHT여야 한다.
@@ -194,9 +194,9 @@ cd ~/hckang/xr_teleoperate
 python active_camera_host/run_teleop_with_neck.py \
   --xr-repo . \
   --input-mode=none \
-  --video-offer-url https://192.168.123.164:60001/offer \
+  --video-offer-url https://192.168.50.9:60001/offer \
   --video-cert /path/to/cert.pem --video-key /path/to/key.pem \
-  --neck-pose-ip 192.168.123.164 --neck-pose-port 5005 --neck-pose-rate 60
+  --neck-pose-ip 192.168.50.9 --neck-pose-port 5005 --neck-pose-rate 60
 ```
 
 3. PC2의 다른 터미널에서 먼저 모터 없이 `python3 pc2/head_pose_receiver.py`를
@@ -235,14 +235,14 @@ PC2 ZMQ JPEG(55555)를 Host가 받아 decode한 뒤 Vuer `ImageBackground`의 �
 python3 pc2/zed_teleimager_server.py
 
 # Host (영상만)
-python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.123.164
+python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.50.9
 
 # Host (영상 + 목 추종, PC2에서 head_pose_receiver.py 실행)
-python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.123.164 \
-  --neck-pose-ip 192.168.123.164
+python active_camera_host/zmq_stereo_vr.py --img-server-ip 192.168.50.9 \
+  --neck-pose-ip 192.168.50.9
 ```
 
-Quest 브라우저에서 기존과 같은 `https://192.168.123.2:8012/?ws=wss://192.168.123.2:8012`로
+Quest 브라우저에서 기존과 같은 `https://192.168.50.3:8012/?ws=wss://192.168.50.3:8012`로
 접속한다. 인증서는 `--cert/--key`, `XR_TELEOP_CERT/KEY`, `~/.config/xr_teleoperate/` 순으로
 찾는다. 2초마다 수신/송신 fps와 영상 지연(PC2 캡처 → Host 시점, clock sync 필요)이
 출력된다. Quest 화면까지의 지연은 여기에 Vuer JPEG 재인코딩과 Wi-Fi 전송이 더해진다.
@@ -271,10 +271,10 @@ ZED stereo 영상과 robot state/action을 episode로 함께 저장하려면 반
 ```bash
 python active_camera_host/run_teleop_with_neck.py \
   --xr-repo . \
-  --neck-pose-ip 192.168.123.164 \
+  --neck-pose-ip 192.168.50.9 \
   --neck-pose-port 5005 \
   --neck-pose-rate 60 \
-  --img-server-ip 192.168.123.164 \
+  --img-server-ip 192.168.50.9 \
   --arm=G1_29 \
   --ee=dex3 \
   --input-mode=hand \
@@ -287,7 +287,7 @@ launcher는 `--xr-repo`와 `--neck-*`만 소비하고 나머지는 현재 설치
 `teleop_hand_and_arm.py`에 그대로 전달한다. Quest 접속 주소도 기존과 같다.
 
 ```text
-https://192.168.123.2:8012/?ws=wss://192.168.123.2:8012
+https://192.168.50.3:8012/?ws=wss://192.168.50.3:8012
 ```
 
 녹화된 각 timestep에는 ZED left/right가 각각 `color_0`, `color_1`로 저장된다.
@@ -308,8 +308,8 @@ G1_29_ArmIK/Controller, Dex3_1_Controller, ImageClient, EpisodeWriter)로 루프
 cd ~/xr_teleoperate
 python active_camera_host/teleop_record_dex3_tactile.py \
   --xr-repo . \
-  --img-server-ip 192.168.123.164 \
-  --neck-pose-ip 192.168.123.164 --neck-pose-port 5005 --neck-pose-rate 60 \
+  --img-server-ip 192.168.50.9 \
+  --neck-pose-ip 192.168.50.9 --neck-pose-port 5005 --neck-pose-rate 60 \
   --neck-state-port 5006 \
   --record \
   --task-dir ./utils/data --task-name active_stereo_task
@@ -408,8 +408,8 @@ python active_camera_host/deploy_act.py \
   --xr-repo . \
   --checkpoint /path/to/policy_best.ckpt \
   --train-script /path/to/training/train_act.py \
-  --img-server-ip 192.168.123.164 \
-  --neck-pose-ip 192.168.123.164 \
+  --img-server-ip 192.168.50.9 \
+  --neck-pose-ip 192.168.50.9 \
   --dry-run
 ```
 

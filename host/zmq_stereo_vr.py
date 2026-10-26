@@ -50,7 +50,7 @@ def positive_rate(value: str) -> float:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Display the Host-received ZED ZMQ stereo stream in the Quest via Vuer.")
-    parser.add_argument("--img-server-ip", default="192.168.123.164", help="PC2 address")
+    parser.add_argument("--img-server-ip", default="192.168.50.9", help="PC2 address")
     parser.add_argument("--zmq-port", type=int, default=55555,
                         help="teleimager head_camera ZMQ port")
     parser.add_argument("--display-fps", type=positive_rate, default=30.0)
@@ -63,7 +63,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--key", help="TLS key; default XR_TELEOP_KEY or "
                         "~/.config/xr_teleoperate/key.pem")
     parser.add_argument("--neck-pose-ip", default=None,
-                        help="forward the Quest head pose to PC2 (e.g. 192.168.123.164)")
+                        help="forward the Quest head pose to PC2 (e.g. 192.168.50.9)")
     parser.add_argument("--neck-pose-port", type=int, default=5005)
     parser.add_argument("--neck-pose-rate", type=positive_rate, default=60.0)
     parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT)
