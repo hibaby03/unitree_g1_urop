@@ -10,6 +10,13 @@ import sys
 import time
 from typing import Optional, Sequence
 
+if __package__:
+    from .neck_trace import TraceWriter, enabled, sync_port
+    from .frame_timing import ClockSyncServer
+else:
+    from neck_trace import TraceWriter, enabled, sync_port
+    from frame_timing import ClockSyncServer
+
 try:
     from .active_camera_protocol import (
         PACKET_SIZE,
@@ -188,7 +195,15 @@ def run(args: argparse.Namespace) -> int:
     print_period = 1.0 / args.print_rate
     timeout_seconds = args.timeout_ms / 1000.0
 
+    trace = None
+    clock_server = None
     try:
+        if enabled():
+            trace = TraceWriter("pc2")
+            # Separate from the camera server's 5007; still works without video.
+            clock_server = ClockSyncServer(bind=args.bind, port=sync_port())
+            trace.emit({"event": "receiver_config", "args": vars(args),
+                        "clock_sync_port": clock_server.port})
         while True:
             now = time.monotonic()
             if (
@@ -226,111 +241,153 @@ def run(args: argparse.Namespace) -> int:
 
             try:
                 datagram, source = receive_socket.recvfrom(256)
+                rx_ns = time.monotonic_ns() if trace is not None else None
             except socket.timeout:
                 continue
 
+            record = ({"event": "pc2_packet", "rx_pc2_ns": rx_ns,
+                       "source": list(source), "status": "received"} if trace is not None else None)
             try:
-                packet = decode_packet(datagram)
-            except PacketError as error:
-                print(
-                    json.dumps(
-                        {
-                            "event": "packet_rejected",
-                            "source": source[0],
-                            "reason": str(error),
-                        },
-                        separators=(",", ":"),
-                    ),
-                    file=sys.stderr,
-                    flush=True,
-                )
-                continue
-
-            if not is_newer_sequence(packet.sequence, previous_sequence):
-                continue
-            previous_sequence = packet.sequence
-
-            target = mapper.update(packet)
-            if target is None:
-                continue
-
-            sample_pc2_time_ns = time.monotonic_ns()
-            now_monotonic = sample_pc2_time_ns / 1_000_000_000.0
-            last_valid_monotonic = now_monotonic
-            stale_reported = False
-
-            motor_positions = None
-            motor_command_pc2_time_ns = None
-            if neck is not None:
-                motor_command_pc2_time_ns = time.monotonic_ns()
-                motor_positions = neck.write_angles(
-                    target.yaw_deg,
-                    target.pitch_deg,
-                )
-
-            if state_sender is not None:
-                present_deg = present_position = present_time_ns = None
-                state_error = None
-                if neck is not None:
-                    try:
-                        present_time_ns = time.monotonic_ns()
-                        present_deg, present_position = neck.read_present_angles()
-                    except DynamixelNeckError as error:
-                        present_time_ns = None
-                        state_error = f"encoder read failed: {error}"
                 try:
-                    state_sender.send(
-                        args.neck_state_host or source[0],
-                        NeckState(
-                            pose_sequence=target.sequence,
-                            command_pc2_monotonic_ns=(
-                                motor_command_pc2_time_ns or sample_pc2_time_ns
-                            ),
-                            command_deg=(target.yaw_deg, target.pitch_deg),
-                            goal_position=motor_positions,
-                            present_pc2_monotonic_ns=present_time_ns,
-                            present_deg=present_deg,
-                            present_position=present_position,
-                            torque_enabled=neck is not None and neck.torque_enabled,
-                        ),
-                    )
-                except OSError as error:
-                    state_error = f"send failed: {error}"
-                # Report each distinct failure once instead of at the pose rate.
-                if state_error != last_state_error and state_error is not None:
+                    packet = decode_packet(datagram)
+                    if record is not None:
+                        record.update(packet_seq=packet.sequence, sender_time_ns=packet.sender_time_ns,
+                                      packet_uid=f"{packet.sequence}:{packet.sender_time_ns}",
+                                      orientation=packet.orientation, status="decoded")
+                except PacketError as error:
+                    if record is not None:
+                        record.update(status="rejected", error=str(error))
                     print(
                         json.dumps(
-                            {"event": "neck_state_error", "reason": state_error},
+                            {
+                                "event": "packet_rejected",
+                                "source": source[0],
+                                "reason": str(error),
+                            },
                             separators=(",", ":"),
                         ),
                         file=sys.stderr,
                         flush=True,
                     )
-                last_state_error = state_error
+                    continue
 
-            if now_monotonic - last_print_monotonic < print_period:
-                continue
-            last_print_monotonic = now_monotonic
+                if not is_newer_sequence(packet.sequence, previous_sequence):
+                    if record is not None:
+                        record["status"] = "old_sequence"
+                    continue
+                previous_sequence = packet.sequence
 
-            clock_delta_ms = (time.time_ns() - target.sender_time_ns) / 1_000_000.0
-            output = {
-                "sequence": target.sequence,
-                "yaw_deg": round(target.yaw_deg, 4),
-                "pitch_deg": round(target.pitch_deg, 4),
-                "tracked": True,
-                "source": source[0],
-                "pc2_monotonic_ns": sample_pc2_time_ns,
-            }
-            # This is only a latency estimate when Quest and Jetson wall clocks
-            # are synchronized. Keep implausible values out of normal output.
-            if -1000.0 <= clock_delta_ms <= 10_000.0:
-                output["clock_delta_ms"] = round(clock_delta_ms, 3)
-            if motor_positions is not None:
-                output["motor_command_pc2_monotonic_ns"] = motor_command_pc2_time_ns
-                output["yaw_position"] = motor_positions[0]
-                output["pitch_position"] = motor_positions[1]
+                target = mapper.update(packet)
+                if target is None:
+                    if record is not None:
+                        record["status"] = "untracked"
+                    continue
+                if record is not None:
+                    record.update(target_ready_pc2_ns=time.monotonic_ns(),
+                                  target_deg=[target.yaw_deg, target.pitch_deg], status="processed")
 
-            print(json.dumps(output, separators=(",", ":")), flush=True)
+                sample_pc2_time_ns = time.monotonic_ns()
+                now_monotonic = sample_pc2_time_ns / 1_000_000_000.0
+                last_valid_monotonic = now_monotonic
+                stale_reported = False
+
+                motor_positions = None
+                motor_command_pc2_time_ns = None
+                if neck is not None:
+                    motor_command_pc2_time_ns = time.monotonic_ns()
+                    if record is not None:
+                        record["write_start_pc2_ns"] = time.monotonic_ns()
+                    try:
+                        motor_positions = neck.write_angles(
+                            target.yaw_deg,
+                            target.pitch_deg,
+                        )
+                    finally:
+                        if record is not None:
+                            record["write_end_pc2_ns"] = time.monotonic_ns()
+                            record["goal_position"] = motor_positions
+
+                if state_sender is not None:
+                    present_deg = present_position = present_time_ns = None
+                    state_error = None
+                    if neck is not None:
+                        try:
+                            present_time_ns = time.monotonic_ns()
+                            if record is not None:
+                                record["read_start_pc2_ns"] = time.monotonic_ns()
+                            present_deg, present_position = neck.read_present_angles()
+                        except DynamixelNeckError as error:
+                            present_time_ns = None
+                            state_error = f"encoder read failed: {error}"
+                            if record is not None:
+                                record["encoder_error"] = str(error)
+                        finally:
+                            if record is not None:
+                                record.update(read_end_pc2_ns=time.monotonic_ns(),
+                                              present_deg=present_deg, present_position=present_position)
+                    try:
+                        state_sender.send(
+                            args.neck_state_host or source[0],
+                            NeckState(
+                                pose_sequence=target.sequence,
+                                command_pc2_monotonic_ns=(
+                                    motor_command_pc2_time_ns or sample_pc2_time_ns
+                                ),
+                                command_deg=(target.yaw_deg, target.pitch_deg),
+                                goal_position=motor_positions,
+                                present_pc2_monotonic_ns=present_time_ns,
+                                present_deg=present_deg,
+                                present_position=present_position,
+                                torque_enabled=neck is not None and neck.torque_enabled,
+                            ),
+                        )
+                    except OSError as error:
+                        state_error = f"send failed: {error}"
+                        if record is not None:
+                            record["feedback_error"] = str(error)
+                    # Report each distinct failure once instead of at the pose rate.
+                    if state_error != last_state_error and state_error is not None:
+                        print(
+                            json.dumps(
+                                {"event": "neck_state_error", "reason": state_error},
+                                separators=(",", ":"),
+                            ),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    last_state_error = state_error
+
+                if now_monotonic - last_print_monotonic < print_period:
+                    continue
+                last_print_monotonic = now_monotonic
+
+                clock_delta_ms = (time.time_ns() - target.sender_time_ns) / 1_000_000.0
+                output = {
+                    "sequence": target.sequence,
+                    "yaw_deg": round(target.yaw_deg, 4),
+                    "pitch_deg": round(target.pitch_deg, 4),
+                    "tracked": True,
+                    "source": source[0],
+                    "pc2_monotonic_ns": sample_pc2_time_ns,
+                }
+                # This is only a latency estimate when Quest and Jetson wall clocks
+                # are synchronized. Keep implausible values out of normal output.
+                if -1000.0 <= clock_delta_ms <= 10_000.0:
+                    output["clock_delta_ms"] = round(clock_delta_ms, 3)
+                if motor_positions is not None:
+                    output["motor_command_pc2_monotonic_ns"] = motor_command_pc2_time_ns
+                    output["yaw_position"] = motor_positions[0]
+                    output["pitch_position"] = motor_positions[1]
+
+                print(json.dumps(output, separators=(",", ":")), flush=True)
+            except BaseException as error:
+                if record is not None:
+                    record.update(status="exception", error=repr(error))
+                raise
+            finally:
+                if record is not None:
+                    record["loop_end_pc2_ns"] = time.monotonic_ns()
+                    trace.emit(record)
 
     except KeyboardInterrupt:
         print('{"event":"stopped"}', flush=True)
@@ -339,8 +396,14 @@ def run(args: argparse.Namespace) -> int:
         receive_socket.close()
         if state_sender is not None:
             state_sender.close()
-        if neck is not None:
-            neck.close()
+        try:
+            if neck is not None:
+                neck.close()
+        finally:
+            if clock_server is not None:
+                clock_server.close()
+            if trace is not None:
+                trace.close()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

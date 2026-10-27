@@ -3,6 +3,15 @@
 from __future__ import annotations
 
 import math
+
+if __package__:
+    from .neck_trace import (TraceWriter, SharedPose, enabled,
+                             install_televuer_hook, send_televuer_pose)
+    from .neck_clock import ClockProbe
+else:
+    from neck_trace import (TraceWriter, SharedPose, enabled,
+                            install_televuer_hook, send_televuer_pose)
+    from neck_clock import ClockProbe
 import socket
 import struct
 import time
@@ -145,15 +154,51 @@ class HeadPoseUdpSender:
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sequence = 0
         self._closed = False
+        self._trace = None
+        self._clock_probe = None
+        if enabled():
+            try:
+                self._trace = TraceWriter("host")
+                self._clock_probe = ClockProbe(destination_ip, self._trace)
+            except BaseException:
+                self.close()
+                raise
 
-    def send_openxr_matrix(self, matrix: Any) -> None:
+    def send_openxr_matrix(self, matrix: Any, *, pose_stamp=None) -> None:
         if self._closed:
             raise RuntimeError("sender is closed")
-        datagram = build_packet_from_openxr_matrix(matrix, self._sequence)
-        self._socket.sendto(datagram, self.destination)
-        self._sequence = (self._sequence + 1) & 0xFFFFFFFF
+        # Preserve the original 48-byte packet, including its epoch timestamp.
+        packet_wall_ns = time.time_ns()
+        datagram = build_packet_from_openxr_matrix(matrix, self._sequence, packet_wall_ns)
+        if self._trace is None:
+            self._socket.sendto(datagram, self.destination)
+            self._sequence = (self._sequence + 1) & 0xFFFFFFFF
+            return
+        record = {"event": "host_packet", "packet_seq": self._sequence,
+                  "sender_time_ns": packet_wall_ns,
+                  "packet_uid": f"{self._sequence}:{packet_wall_ns}",
+                  "pose_id": None, "pose_rx_host_ns": None,
+                  "destination": list(self.destination),
+                  "input_matrix": [[float(v) for v in row] for row in matrix]}
+        if pose_stamp:
+            record.update(pose_stamp)
+        record["send_start_host_ns"] = time.monotonic_ns()
+        try:
+            self._socket.sendto(datagram, self.destination)
+        except OSError as error:
+            record["send_error"] = str(error)
+            raise
+        else:
+            self._sequence = (self._sequence + 1) & 0xFFFFFFFF
+        finally:
+            record["send_end_host_ns"] = time.monotonic_ns()
+            self._trace.emit(record)
 
     def close(self) -> None:
         if not self._closed:
             self._socket.close()
             self._closed = True
+            if self._clock_probe is not None:
+                self._clock_probe.close()
+            if self._trace is not None:
+                self._trace.close()

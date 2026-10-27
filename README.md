@@ -1,5 +1,10 @@
 # xr_teleoperate + ZED Mini 2-DoF active stereo camera
 
+목 추종 지연을 측정하려면 [Quest–목 모터 지연 계측 안내](NECK_LATENCY_KO.md)를 참고한다.
+Host/PC2 실행 시 `NECK_TRACE_DIR`를 지정하면 구간별 시간과 자세·패킷 ID를 기록한다.
+계측용 시계 오프셋 측정은 UDP 5010을 사용하며 기본 제어 패킷과 제어 순서는 유지한다.
+Host에는 `host/`만, PC2에는 `pc2/`만 복사하면 된다. 추가 공용 폴더는 필요 없다.
+
 ## 빠른 실행 (영상 + 목 추종)
 
 현재 네트워크: Host `192.168.50.3`, 로봇/PC2 `192.168.50.9`. 아래 기본값에

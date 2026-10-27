@@ -29,12 +29,12 @@ from typing import Any, Callable, Optional, Sequence
 try:
     from .frame_timing import (DEFAULT_SYNC_PORT, ClockSyncClient, FrameStamp,
                                parse_jpeg_stamp)
-    from .head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix
+    from .head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix, enabled
 except ImportError:
     from frame_timing import (  # type: ignore[no-redef]
         DEFAULT_SYNC_PORT, ClockSyncClient, FrameStamp, parse_jpeg_stamp)
     from head_pose_udp import (  # type: ignore[no-redef]
-        HeadPoseUdpSender, _validated_pose_matrix)
+        HeadPoseUdpSender, _validated_pose_matrix, enabled)
 
 
 HEAD_POSE_MAX_AGE_S = 0.25  # same freshness rule as run_teleop_with_neck.py
@@ -208,13 +208,20 @@ class HeadPoseForwarder:
         self._lock = threading.Lock()
         self._matrix: Optional[list[list[float]]] = None
         self._received = 0.0
+        self._pose_id = 0
+        self._pose_stamp = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="head-pose-udp", daemon=True)
         self._thread.start()
 
-    def update(self, matrix: list[list[float]]) -> None:
+    def update(self, matrix: list[list[float]], receive_ns=None, wall_ns=None) -> None:
+        receive_ns = time.monotonic_ns() if receive_ns is None else receive_ns
+        wall_ns = time.time_ns() if wall_ns is None else wall_ns
         with self._lock:
-            self._matrix, self._received = matrix, time.monotonic()
+            self._matrix, self._received = matrix, receive_ns / 1e9
+            self._pose_id += 1
+            self._pose_stamp = {"pose_id": self._pose_id, "pose_rx_host_ns": receive_ns,
+                                "pose_rx_host_wall_ns": wall_ns}
 
     def fresh_matrix(self) -> Optional[list[list[float]]]:
         """None when no pose arrived in the last 250 ms, so PC2's watchdog
@@ -229,10 +236,18 @@ class HeadPoseForwarder:
     def _loop(self) -> None:
         deadline = time.monotonic()
         while not self._stop.is_set():
-            matrix = self.fresh_matrix()
+            if enabled():
+                with self._lock:
+                    matrix = (self._matrix if time.monotonic() - self._received <= HEAD_POSE_MAX_AGE_S else None)
+                    stamp = self._pose_stamp
+            else:
+                matrix = self.fresh_matrix()
             if matrix is not None:
                 try:
-                    self._sender.send_openxr_matrix(matrix)
+                    if enabled():
+                        self._sender.send_openxr_matrix(matrix, pose_stamp=stamp)
+                    else:
+                        self._sender.send_openxr_matrix(matrix)
                 except (OSError, ValueError):
                     pass
             deadline += self._period
@@ -267,10 +282,11 @@ def run(args: argparse.Namespace) -> int:
                queries=dict(grid=False), queue_len=3)
 
     async def on_camera_move(event, _session):
+        rx, wall = time.monotonic_ns(), time.time_ns()
         if forwarder is None:
             return
         try:
-            forwarder.update(camera_move_matrix(event.value["camera"]["matrix"]))
+            forwarder.update(camera_move_matrix(event.value["camera"]["matrix"]), rx, wall)
         except (KeyError, TypeError, ValueError, IndexError):
             pass
 

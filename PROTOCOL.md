@@ -1,5 +1,13 @@
 # Active-camera UDP protocol v1
 
+Optional neck latency tracing leaves this 48-byte wire format unchanged.
+Host and PC2 JSONL records join by `(sequence, sender_time_ns)`; the Host's
+CAMERA_MOVE `pose_id` is joined offline, not appended to the control packet.
+The independent trace clock probe uses the ACLK exchange below on UDP 5010
+by default, separate from the video server's UDP 5007. Host tools live in `host/`
+and PC2 tools in `pc2/`; each folder can be deployed independently.
+Run `host/analyze_neck_latency.py` to join logs. See `NECK_LATENCY_KO.md`.
+
 Each UDP datagram contains exactly one 48-byte head-pose packet. All multi-byte
 values use network byte order (big endian).
 

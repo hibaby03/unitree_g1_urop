@@ -36,12 +36,12 @@ from typing import Any, Optional, Sequence
 try:
     from .frame_timing import (DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader,
                                frame_timing_entry)
-    from .head_pose_udp import HeadPoseUdpSender
+    from .head_pose_udp import HeadPoseUdpSender, enabled, install_televuer_hook, send_televuer_pose
     from .neck_state_receiver import NeckStateReceiver, neck_record_entries
 except ImportError:
     from frame_timing import (  # type: ignore[no-redef]
         DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader, frame_timing_entry)
-    from head_pose_udp import HeadPoseUdpSender  # type: ignore[no-redef]
+    from head_pose_udp import HeadPoseUdpSender, enabled, install_televuer_hook, send_televuer_pose  # type: ignore[no-redef]
     from neck_state_receiver import (  # type: ignore[no-redef]
         NeckStateReceiver, neck_record_entries)
 
@@ -191,7 +191,7 @@ class NeckPoseForwarder:
         deadline = time.perf_counter()
         while not self._stop.is_set():
             try:
-                self._sender.send_openxr_matrix(self._televuer.head_pose)
+                send_televuer_pose(self._sender, self._televuer)
             except (OSError, ValueError):
                 # The shared matrix is all-zero until the first CAMERA_MOVE.
                 pass
@@ -324,6 +324,8 @@ def run(args: argparse.Namespace) -> int:
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
     from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
     from televuer import TeleVuerWrapper
+    if enabled():
+        install_televuer_hook(sys.modules[TeleVuerWrapper.__module__].TeleVuer)
     from teleimager.image_client import ImageClient
     from teleop.robot_control.robot_arm import G1_29_ArmController
     from teleop.robot_control.robot_arm_ik import G1_29_ArmIK

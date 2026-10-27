@@ -64,8 +64,14 @@ def parse_launcher_args(
     return args, remaining
 
 
-def send_fresh_head_pose(pose_shared, sender, max_age=0.25) -> bool:
+def send_fresh_head_pose(pose_shared, sender, max_age=0.25, trace_pose=None) -> bool:
     """Do not renew the PC2 watchdog using a cached pose after XR disconnects."""
+    if trace_pose is not None:
+        snapshot = trace_pose.snapshot()
+        if snapshot is None or (time.monotonic_ns() - snapshot[1]["pose_rx_host_ns"]) / 1e9 > max_age:
+            return False
+        sender.send_openxr_matrix(snapshot[0], pose_stamp=snapshot[1])
+        return True
     with pose_shared.get_lock():
         sample = list(pose_shared[:])
     if sample[16] <= 0 or time.monotonic() - sample[16] > max_age:
@@ -108,9 +114,9 @@ def run_video_only(args: argparse.Namespace) -> int:
     label = "neck-only" if neck_only else "video-only"
     if neck_only:
         try:
-            from .head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix
+            from .head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix, SharedPose, enabled
         except ImportError:
-            from head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix
+            from head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix, SharedPose, enabled
 
     endpoint = urlsplit(args.video_offer_url)
     if (endpoint.scheme != "https" or not endpoint.hostname
@@ -156,6 +162,7 @@ def run_video_only(args: argparse.Namespace) -> int:
             # the validated pose and receipt time under one lock.
             if neck_only:
                 self.neck_pose_shared = multiprocessing.Array("d", 17, lock=True)
+                self.neck_trace_pose = SharedPose() if enabled() else None
             try:
                 super().__init__(**kwargs)
             except BaseException:
@@ -163,6 +170,7 @@ def run_video_only(args: argparse.Namespace) -> int:
                 raise
 
         async def on_cam_move(self, event, session, fps=60):
+            rx, wall = time.monotonic_ns(), time.time_ns()
             await super().on_cam_move(event, session)
             if not neck_only:
                 return
@@ -177,6 +185,8 @@ def run_video_only(args: argparse.Namespace) -> int:
                 ])
             except (KeyError, TypeError, ValueError, IndexError):
                 return
+            if self.neck_trace_pose is not None:
+                self.neck_trace_pose.update(matrix, rx, wall)
             with self.neck_pose_shared.get_lock():
                 self.neck_pose_shared[:] = [
                     value for row in matrix for value in row
@@ -229,7 +239,7 @@ def run_video_only(args: argparse.Namespace) -> int:
             loop_start = time.monotonic()
             if sender is not None:
                 try:
-                    if send_fresh_head_pose(viewer.neck_pose_shared, sender):
+                    if send_fresh_head_pose(viewer.neck_pose_shared, sender, trace_pose=viewer.neck_trace_pose):
                         last_send_error = None
                 except (OSError, ValueError) as error:
                     if str(error) != last_send_error:
@@ -277,8 +287,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sys.path.insert(0, str(repository))
     import televuer  # Imported after the selected repository is on sys.path.
-    from head_pose_udp import HeadPoseUdpSender
+    from head_pose_udp import HeadPoseUdpSender, enabled, install_televuer_hook, send_televuer_pose
 
+    if enabled():
+        # Patch the class object referenced by the installed wrapper before its fork.
+        wrapper_module = sys.modules[televuer.TeleVuerWrapper.__module__]
+        install_televuer_hook(wrapper_module.TeleVuer)
     original_wrapper = televuer.TeleVuerWrapper
     destination_ip = launcher_args.neck_pose_ip
     destination_port = launcher_args.neck_pose_port
@@ -302,7 +316,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 try:
                     # TeleVuer exposes the raw OpenXR matrix here. Reading it
                     # directly avoids waiting for the arm IK/control loop.
-                    self._neck_sender.send_openxr_matrix(self.tvuer.head_pose)
+                    send_televuer_pose(self._neck_sender, self.tvuer)
                 except (OSError, ValueError):
                     # The shared matrix is all-zero until the first CAMERA_MOVE.
                     pass
