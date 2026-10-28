@@ -28,6 +28,8 @@ python active_camera_host/zmq_stereo_vr.py
 https://192.168.50.3:8012/?ws=wss://192.168.50.3:8012
 ```
 
+- 목 수신기는 켜는 즉시 **현재 위치를 goal로 잡고 토크를 유지**하므로 처지지 않고,
+  첫 Quest pose가 올 때까지 그 자세로 기다린다.
 - 정면을 본 상태에서 목 수신기를 켜면 그 자세가 중립이 된다.
 - 영상만 보고 목은 끄려면 Host에서 `--no-neck`.
 - 목 방향이 반대면 PC2 수신기에 `--yaw-sign`/`--pitch-sign`을 뒤집는다(기본 yaw -1, pitch +1).

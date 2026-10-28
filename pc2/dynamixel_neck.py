@@ -160,6 +160,17 @@ class DynamixelNeck:
                     self.configuration.profile_velocity,
                 )
 
+            # Hold the current pose: set goal = present (while torque is still
+            # off) so that enabling torque does not snap the neck to a stale
+            # goal register value, and so it actively holds instead of sagging
+            # under gravity before the first Quest pose arrives.
+            yaw_present, pitch_present = self.read_present_positions()
+            for motor_id, present in (
+                (self.configuration.yaw_id, yaw_present),
+                (self.configuration.pitch_id, pitch_present),
+            ):
+                self._write4(motor_id, ADDR_GOAL_POSITION, present & 0xFFFFFFFF)
+
             for motor_id in self._motor_ids:
                 self._write1(motor_id, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
             self._torque_enabled = True

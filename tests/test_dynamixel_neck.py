@@ -146,6 +146,7 @@ class DynamixelNeckTests(unittest.TestCase):
             sdk_module=sdk,
         )
 
+        sdk.sync_read.present = {1: 2048, 2: 2048}  # connect holds the current pose
         neck.connect()
         yaw_position, pitch_position = neck.write_angles(90.0, 90.0)
 
@@ -165,12 +166,30 @@ class DynamixelNeckTests(unittest.TestCase):
         self.assertTrue(sdk.port.closed)
         self.assertFalse(neck.torque_enabled)
 
+    def test_connect_holds_current_pose_before_enabling_torque(self):
+        sdk = FakeSdk()
+        neck = DynamixelNeck(NeckConfiguration(yaw_id=5, pitch_id=6), sdk_module=sdk)
+        sdk.sync_read.present = {5: 2181, 6: 2133}
+        neck.connect()
+
+        # Goal = present is written (ids 5/6) before torque enable, so the neck
+        # holds where it is instead of sagging.
+        goal_writes = [w for w in sdk.packet.writes if w[:3][0] == 4 and w[2] == ADDR_GOAL_POSITION]
+        self.assertIn((4, 5, ADDR_GOAL_POSITION, 2181), goal_writes)
+        self.assertIn((4, 6, ADDR_GOAL_POSITION, 2133), goal_writes)
+        goal_idx = sdk.packet.writes.index((4, 5, ADDR_GOAL_POSITION, 2181))
+        torque_on = next(i for i, w in enumerate(sdk.packet.writes)
+                         if w == (1, 5, 64, 1))
+        self.assertLess(goal_idx, torque_on)
+        self.assertTrue(neck.torque_enabled)
+
     def test_read_present_angles_uses_center_and_sign(self):
         sdk = FakeSdk()
         neck = DynamixelNeck(
             NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2, yaw_sign=1, pitch_sign=-1),
             sdk_module=sdk,
         )
+        sdk.sync_read.present = {1: 2048, 2: 2048}  # connect holds the current pose
         neck.connect()
         self.assertEqual(sdk.sync_read.address, ADDR_PRESENT_POSITION)
         self.assertEqual(sdk.sync_read.ids, [1, 2])
@@ -184,6 +203,7 @@ class DynamixelNeckTests(unittest.TestCase):
     def test_present_position_is_signed(self):
         sdk = FakeSdk()
         neck = DynamixelNeck(NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2), sdk_module=sdk)
+        sdk.sync_read.present = {1: 2048, 2: 2048}  # connect holds the current pose
         neck.connect()
         sdk.sync_read.present = {1: -5, 2: 10}
 
@@ -192,6 +212,7 @@ class DynamixelNeckTests(unittest.TestCase):
     def test_sync_read_failure_raises(self):
         sdk = FakeSdk()
         neck = DynamixelNeck(NeckConfiguration(baudrate=1_000_000, yaw_id=1, pitch_id=2), sdk_module=sdk)
+        sdk.sync_read.present = {1: 2048, 2: 2048}  # connect holds the current pose
         neck.connect()
         sdk.sync_read.result = 1
         with self.assertRaises(DynamixelNeckError):
