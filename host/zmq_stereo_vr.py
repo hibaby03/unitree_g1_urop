@@ -58,6 +58,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="JPEG quality of the per-eye images sent to the Quest")
     parser.add_argument("--distance", type=float, default=1.0,
                         help="virtual distance of the image plane [m]")
+    parser.add_argument("--screen-y", type=float, default=-0.3,
+                        help="vertical offset of the image plane [m]; negative lowers it")
     parser.add_argument("--cert", help="TLS certificate; default XR_TELEOP_CERT or "
                         "~/.config/xr_teleoperate/cert.pem")
     parser.add_argument("--key", help="TLS key; default XR_TELEOP_KEY or "
@@ -308,10 +310,12 @@ def run(args: argparse.Namespace) -> int:
                     # layers=1 / 2 are rendered only by the left / right eye camera.
                     session.upsert([
                         ImageBackground(left, aspect=aspect, height=1,
+                                        position=[0, args.screen_y, 0],
                                         distanceToCamera=args.distance, layers=1,
                                         format="jpeg", quality=args.jpeg_quality,
                                         key="zed-left", interpolate=True),
                         ImageBackground(right, aspect=aspect, height=1,
+                                        position=[0, args.screen_y, 0],
                                         distanceToCamera=args.distance, layers=2,
                                         format="jpeg", quality=args.jpeg_quality,
                                         key="zed-right", interpolate=True),
