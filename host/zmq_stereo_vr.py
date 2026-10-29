@@ -58,7 +58,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="JPEG quality of the per-eye images sent to the Quest")
     parser.add_argument("--distance", type=float, default=1.0,
                         help="virtual distance of the image plane [m]")
-    parser.add_argument("--screen-y", type=float, default=-0.3,
+    parser.add_argument("--screen-y", type=float, default=-0.1,
                         help="vertical offset of the image plane [m]; negative lowers it")
     parser.add_argument("--cert", help="TLS certificate; default XR_TELEOP_CERT or "
                         "~/.config/xr_teleoperate/cert.pem")
