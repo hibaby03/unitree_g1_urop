@@ -340,25 +340,32 @@ active-stereo-only visual observation과 일치한다. 이 launcher는 설치된
 
 `host/teleop_record_dex3_tactile.py`는 G1_29 + Dex3-1 + hand tracking 전용
 teleop/녹화 스크립트다. `teleop_hand_and_arm.py`와 같은 모듈(TeleVuerWrapper,
-G1_29_ArmIK/Controller, Dex3_1_Controller, ImageClient, EpisodeWriter)로 루프를 직접
-돌리며, 기존 launcher처럼 head pose를 PC2로 보낸다. PC2에서는 2·3절의
+G1_29_ArmIK/Controller, Dex3_1_Controller, EpisodeWriter)로 루프를 직접
+돌린다. 영상은 `teleimager.ImageClient`로 받고 `host/xr_legacy.py`가 구형
+TeleVuerWrapper의 공유메모리에 전달한다. 기존 launcher처럼 head pose를 PC2로 보낸다. PC2에서는 2·3절의
 `zed_teleimager_server.py`와 `head_pose_receiver.py`를 그대로 실행한다.
 
 ```bash
-cd ~/xr_teleoperate
-python active_camera_host/teleop_record_dex3_tactile.py \
-  --xr-repo . \
+conda activate tv
+export PYTHONNOUSERSITE=1
+cd ~/hckang/jslee/unitree_g1_urop
+python -m host.teleop_record_dex3_tactile \
+  --xr-repo ~/hckang/xr_teleoperate \
   --img-server-ip 192.168.50.9 \
   --neck-pose-ip 192.168.50.9 --neck-pose-port 5005 --neck-pose-rate 60 \
   --neck-state-port 5006 \
-  --record \
-  --task-dir ./utils/data --task-name active_stereo_task
+  --network-interface wlo1 --screen-y -0.1 --headless --record \
+  --task-dir ~/hckang/datasets --task-name active_stereo_task
 ```
 
 키는 기존과 같다: `r` 추종 시작, `s` episode 시작/저장, `q` 종료. `--motion`,
-`--headless`, `--display-mode`, `--network-interface`, `--frequency`(기본 30)와
+`--headless`, `--screen-y`, `--network-interface`, `--frequency`(기본 30)와
 `--task-goal/desc/steps`도 받는다. `--arm`, `--ee`, `--input-mode`는 고정이므로 주지
-않는다. `--task-dir`는 기존과 같이 `teleop/` 기준 상대 경로다.
+않는다. 구형 API에서는 `--display-mode immersive`만 지원한다.
+`--task-dir` 상대 경로는 명령을 실행한 디렉터리 기준이며 내부 cwd 변경에 영향을 받지 않는다.
+현재 확인된 Host NIC는 `wlo1`, IP는 `192.168.50.7`이다. Quest URL의 Host 주소는
+실행 시 `ip -br addr` 결과를 사용한다. PC2 주소는 `192.168.50.9`로 유지한다.
+`r`과 양손/머리 추적이 준비된 뒤 팔·손 컨트롤러와 목 추종을 시작한다.
 
 각 item에 저장되는 값:
 
@@ -377,7 +384,12 @@ python active_camera_host/teleop_record_dex3_tactile.py \
 
 | 키 | 내용 |
 | --- | --- |
-| `host_monotonic_ns` | 팔 q를 읽은 직후의 Host `time.monotonic_ns()` (item 기준 시각) |
+| `host_monotonic_ns` | 영상·팔·손·목·tactile snapshot 후, IK 계산 전의 Host item 기준 시각 |
+| `host_wall_ns` | 같은 시점의 Host epoch 시각 |
+| `image_read_host_monotonic_ns` / `image_observed_host_monotonic_ns` | 영상 snapshot을 읽은 시각 / 현재 JPEG를 처음 관측한 시각 (네트워크 수신 시각과는 다름) |
+| `arm_read_host_monotonic_ns` / `hand_read_host_monotonic_ns` / `neck_read_host_monotonic_ns` | 각 상태를 Host에서 읽은 시각 (하드웨어 측정 시각과는 다름) |
+| `action_host_monotonic_ns` | IK 결과를 팔 컨트롤러에 전달한 시각 |
+| `xr_head_received_host_monotonic_ns` / `xr_hand_received_host_monotonic_ns` | Quest 이벤트를 Host에서 받은 시각 |
 | `image_frame_sequence` | PC2가 붙인 ZED frame 번호. 연속 item에서 같으면 같은 영상이 재사용된 것 |
 | `image_pc2_monotonic_ns` | ZED `grab()` 직후 PC2 monotonic 시각 |
 | `image_host_monotonic_ns` | 위 시각을 Host clock으로 옮긴 값 |
@@ -389,27 +401,46 @@ python active_camera_host/teleop_record_dex3_tactile.py \
 따라잡지 않고 다시 시작하므로, 실제 간격은 `host_monotonic_ns` 차이로 확인한다.
 episode를 저장할 때 영상 지연의 median/p95/max가 로그에 찍힌다.
 clock sync는 PC2 `zed_teleimager_server.py`가 UDP 5007로 응답하며, 응답이 없으면
-경고 후 지연 값만 `null`로 녹화한다(`--clock-sync-port`, `--no-clock-sync`).
+지연 값은 `null`로 녹화한다(`--clock-sync-port`, `--no-clock-sync`). 이 경우 캐시된
+JPEG를 500 ms 넘게 재사용하지 않지만 실제 캡처 지연은 확인할 수 없다.
 
 목 yaw는 오른쪽, pitch는 위가 양수이며 center(기본 2048) 기준이다. Host는 녹화
 시점에 가장 최근 packet을 넣으므로, 더 정밀한 정렬이 필요하면 `pc2_monotonic_ns`로
-보간한다. 목 packet을 아직 받지 못했으면 `neck.qpos`는 빈 리스트다.
+보간한다. 동시 하드웨어 트리거 방식이 아니며 가장 최근 관측들을 한 item으로 묶는다.
+목 엔코더·토크·양손 tactile·영상이 누락되거나 500 ms 넘게 오래되면 해당 item은
+저장하지 않고 경고한다. Quest 추적이 끊기면 IK 갱신과 녹화를 중단하고, 머리 이벤트가
+250 ms 이상 끊기면 head UDP 송신을 중단하여 PC2 watchdog이 작동하게 한다.
 
 Dex3-1 tactile은 `Dex3_1_Controller`와 별도로 `rt/dex3/{left,right}/state`를 콜백
 방식으로 구독하여 `HandState_.press_sensor_state`를 읽는다. 한쪽 손 데이터가 끊겨도
 다른 쪽은 계속 갱신된다.
 
-> **Host xr_teleoperate 버전 확인 필요.** 이 스크립트는 최신 upstream API
-> (`teleimager.ImageClient`, `TeleVuerWrapper(display_mode=, zmq=, webrtc=,
-> webrtc_url=, arm_reference_mode=)`)를 기준으로 작성되었다. Host에 예전 TeleVuer
-> (`img_shm_name` 기반)가 설치되어 있으면 생성자 호출이 실패하므로, 아래 결과로
-> 버전을 먼저 확인한다.
->
-> ```bash
-> cd ~/hckang/xr_teleoperate
-> git log -1 --format='%H %cd'
-> grep -n "def __init__" -A3 teleop/televuer/src/televuer/tv_wrapper.py
-> ```
+확인한 `tv` 버전은 `televuer 0.0.3`, `teleimager 1.6.0`, `vuer 0.0.60`,
+`params-proto 2.13.2`, `waterbear 2.6.8`, `logging_mp 0.2.5`, `rerun-sdk 0.20.1`이다.
+televuer/teleimager 모두 현재 체크아웃의 editable 설치다. 패키지를 올리지 않고 다음
+구형 API를 사용한다: `TeleVuerWrapper(img_shm_name=...)`, `get_motion_state_data()`,
+`left_arm_pose/right_arm_pose`, `Dex3_1_Controller`의 5개 위치 인자,
+`EpisodeWriter(task_dir, frequency, image_size, rerun_log)`.
+`get_tele_data()`, `render_to_xr()`, wrapper `close()`는 이 버전에 없으므로 호출하지 않는다.
+
+```bash
+# 설치 경로·버전·생성자 확인. 모터 및 네트워크 초기화 없음
+python -m host.teleop_record_dex3_tactile --check
+# 모터 명령 없이 PC2 영상·G1 DDS·tactile·목 상태를 5초간 수신 점검
+python -m host.teleop_record_dex3_tactile --probe --network-interface wlo1
+# 실제 EpisodeWriter로 합성 JPEG/JSON 저장·재읽기. 실기 데이터와 구분됨
+python -m host.teleop_record_dex3_tactile --smoke-test --headless \
+  --task-dir /tmp/g1-recorder-smoke --task-name synthetic_api_check
+# 저장한 모든 이미지와 30차원 state/action, tactile, Host 시각 검사
+python -m host.teleop_record_dex3_tactile \
+  --validate-episode ~/hckang/datasets/active_stereo_task/episode_0000
+# 실제 설치 패키지의 로컬 HTTPS·ZMQ·pose 이벤트·종료 호환성 검사
+python -m unittest tests.test_xr_legacy_runtime -v
+```
+
+episode `info.packages`에 설치 버전/소스 경로를 남기며 `info.qpos_layout`의 순서는
+`left_arm(7), right_arm(7), left_ee(7), right_ee(7), neck(2)`로 총 30차원이다.
+좌우 Dex3의 index/middle 관절 순서가 달라 `info.joint_names`는 실제 fork enum에서 읽는다.
 
 ## 데이터셋 관점: active-camera state/action
 

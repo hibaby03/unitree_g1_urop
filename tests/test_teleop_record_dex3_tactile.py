@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+import math
 
 from host.teleop_record_dex3_tactile import (
     TOPIC_DEX3_LEFT_STATE,
@@ -7,6 +8,7 @@ from host.teleop_record_dex3_tactile import (
     Dex3TactileSubscriber,
     KeyState,
     build_states_actions,
+    complete_observation,
     parse_args,
     press_sensors_to_dict,
 )
@@ -100,6 +102,45 @@ class StatesActionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_states_actions([0.0] * 14, [0.0] * 14, [0.0] * 14, [0.0] * 14,
                                  [0.0] * 12, [0.0] * 14)
+
+    def test_all_arm_fields_have_fourteen_finite_values(self):
+        valid = [[0.] * 14 for _ in range(6)]
+        for field in range(4):
+            values = [list(v) for v in valid]
+            values[field].pop()
+            with self.assertRaises(ValueError):
+                build_states_actions(*values)
+        valid[3][5] = math.nan
+        with self.assertRaises(ValueError):
+            build_states_actions(*valid)
+
+
+class ObservationReadinessTests(unittest.TestCase):
+    def setUp(self):
+        self.frame = SimpleNamespace(bgr="image")
+        self.neck = SimpleNamespace(present_deg=(1., 2.), torque_enabled=True)
+        self.touch = {side: {"pressure": [[1.] * 12], "age_ms": 1.}
+                      for side in ("left_ee", "right_ee")}
+
+    def test_complete_recent_observation_is_accepted(self):
+        self.assertTrue(complete_observation(self.frame, 10., (self.neck, 1.), self.touch))
+
+    def test_missing_encoder_or_one_hand_is_rejected(self):
+        self.assertFalse(complete_observation(self.frame, 10., (None, None), self.touch))
+        self.neck.present_deg = None
+        self.assertFalse(complete_observation(self.frame, 10., (self.neck, 1.), self.touch))
+        self.neck.present_deg = (0., 0.)
+        self.touch["right_ee"] = None
+        self.assertFalse(complete_observation(self.frame, 10., (self.neck, 1.), self.touch))
+
+    def test_stale_observations_and_disabled_torque_are_rejected(self):
+        self.assertFalse(complete_observation(self.frame, 501., (self.neck, 1.), self.touch))
+        self.assertFalse(complete_observation(self.frame, 10., (self.neck, 501.), self.touch))
+        self.touch["left_ee"]["age_ms"] = 501.
+        self.assertFalse(complete_observation(self.frame, 10., (self.neck, 1.), self.touch))
+        self.touch["left_ee"]["age_ms"] = 1.
+        self.neck.torque_enabled = False
+        self.assertFalse(complete_observation(self.frame, 10., (self.neck, 1.), self.touch))
 
 
 class KeyAndArgumentTests(unittest.TestCase):
