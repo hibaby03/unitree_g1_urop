@@ -14,8 +14,10 @@ import time
 
 try:
     from .head_pose_udp import _validated_pose_matrix
+    from .recorder_diagnostics import PoseEventDiagnostics
 except ImportError:
     from head_pose_udp import _validated_pose_matrix
+    from recorder_diagnostics import PoseEventDiagnostics
 
 
 def installed_versions() -> dict:
@@ -87,6 +89,7 @@ class LegacyStereoXR:
                 # Allocate before the original constructor forks the Vuer server.
                 self.head_received_ns = mp.Value("Q", 0)
                 self.hand_received_ns = mp.Value("Q", 0)
+                self.pose_event_diagnostics = PoseEventDiagnostics()
                 # The legacy TeleVuer stores only an ndarray backed by a
                 # constructor-local SharedMemory attachment. Its destructor
                 # unmaps that buffer; rendering it can segfault. Retain the
@@ -116,24 +119,36 @@ class LegacyStereoXR:
             async def on_cam_move(self, event, session, fps=60):
                 try:
                     _validated_pose_matrix(np.asarray(event.value["camera"]["matrix"]).reshape(4, 4, order="F"))
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError) as error:
+                    self.pose_event_diagnostics.update("head", f"camera.matrix: {type(error).__name__}: {error}")
                     return
                 await super().on_cam_move(event, session, fps)
                 self.head_received_ns.value = time.monotonic_ns()
+                self.pose_event_diagnostics.update("head")
 
             async def on_hand_move(self, event, session, fps=60):
+                stage = "hand payload"
                 try:
                     for side in ("left", "right"):
+                        stage = f"{side} hand payload"
                         values = np.asarray(event.value[side], dtype=float)
                         if values.shape != (400,) or not np.isfinite(values).all():
+                            reason = (f"expected shape=(400,), got shape={values.shape}"
+                                      if values.shape != (400,) else "contains NaN or infinity")
+                            self.pose_event_diagnostics.update("hand", f"{stage}: {reason}; remaining checks not run")
                             return
+                        stage = f"{side} wrist pose"
                         _validated_pose_matrix(values[:16].reshape(4, 4, order="F"))
+                        stage = f"{side}State"
                         if not isinstance(event.value[side + "State"], dict):
+                            self.pose_event_diagnostics.update("hand", f"{stage}: expected dict; remaining checks not run")
                             return
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError) as error:
+                    self.pose_event_diagnostics.update("hand", f"{stage}: {type(error).__name__}: {error}; remaining checks not run")
                     return
                 await super().on_hand_move(event, session, fps)
                 self.hand_received_ns.value = time.monotonic_ns()
+                self.pose_event_diagnostics.update("hand")
 
             async def main_image_binocular(self, session, fps=60):
                 import cv2

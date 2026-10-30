@@ -41,6 +41,7 @@ try:
     from .head_pose_udp import HeadPoseUdpSender, enabled, install_televuer_hook, send_televuer_pose
     from .neck_state_receiver import NeckStateReceiver, neck_record_entries
     from .xr_legacy import LegacyStereoXR, LegacyHandSession, check_legacy_api, installed_versions
+    from .recorder_diagnostics import TerminalDiagnostics, xr_status, pose_status, observation_status
     from .zmq_stereo_vr import resolve_tls
 except ImportError:
     from frame_timing import (  # type: ignore[no-redef]
@@ -49,6 +50,7 @@ except ImportError:
     from neck_state_receiver import (  # type: ignore[no-redef]
         NeckStateReceiver, neck_record_entries)
     from xr_legacy import LegacyStereoXR, LegacyHandSession, check_legacy_api, installed_versions
+    from recorder_diagnostics import TerminalDiagnostics, xr_status, pose_status, observation_status
     from zmq_stereo_vr import resolve_tls
 
 
@@ -460,10 +462,12 @@ def validate_episode(path) -> dict:
             "errors": errors, "ok": not errors}
 
 class KeyState:
-    def __init__(self) -> None:
+    def __init__(self, log=None, record_enabled=True) -> None:
         self.start = False
         self.stop = False
         self.record_toggle = False
+        self._log = log
+        self._record_enabled = record_enabled
 
     def on_press(self, key: str) -> None:
         if key == "r":
@@ -473,6 +477,22 @@ class KeyState:
             self.stop = True
         elif key == "s" and self.start:
             self.record_toggle = True
+        # Report only: the state transitions above intentionally remain unchanged.
+        if self._log is not None and key in ("r", "s", "q"):
+            if key == "r":
+                message = "r received (start requested)."
+            elif key == "q":
+                message = "q received (stop requested)."
+            elif not self.start:
+                message = "s received; ignored because r has not been received."
+            elif not self._record_enabled:
+                message = "s received; recording DISABLED (launch with --record)."
+            else:
+                message = "s received; record/save requested (processed after teleop initialization)."
+            try:
+                self._log("[key] " + message)
+            except Exception:
+                pass
 
 
 def smoke_test(args, writer_class) -> int:
@@ -607,11 +627,13 @@ def run(args: argparse.Namespace) -> int:
     if args.network_interface:
         os.environ["UNITREE_NETWORK_INTERFACE"] = args.network_interface
 
-    keys = KeyState()
+    keys = KeyState(logger.info, record_enabled=args.record)
+    diagnostics = TerminalDiagnostics(logger.info)
     img_client = clock_sync = xr = neck = neck_state = tactile = None
     arm_ctrl = recorder = hand_session = keyboard_thread = None
     record_running = False
     cleanup_errors = []
+    diagnostic_stage = "image/XR/recorder initialization"
     try:
         # Start image/XR first. Arm and hand controllers are constructed only
         # after the operator presses r and both hands are tracked.
@@ -637,24 +659,52 @@ def run(args: argparse.Namespace) -> int:
         keyboard_thread.start()
         logger.info("Quest: https://<Host-IP>:8012/?ws=wss://<Host-IP>:8012 ; "
                     "press [r] with both hands tracked to start, [s] record/save, [q] quit.")
+        logger.info("[diagnostics] Start requires r + accepted head/both-hand events <500ms + an image. "
+                    "Neck encoders and tactile are checked for recording, not for the start gate.")
+        diagnostic_stage = "waiting for teleop start conditions"
         while not keys.stop:
             frame = head_frames.read()
             if frame.bgr is not None:
                 xr.render(frame.bgr)
             xr.get_motion_state_data()  # also detect an early Vuer server failure
             if keys.start and xr.tracking_ready() and frame.bgr is not None:
+                logger.info("[start] Conditions PASSED | " + " | ".join(
+                    message for _, message in xr_status(xr)) + " | image received. Initializing robot controllers.")
                 break
+            if keys.start:
+                diagnostics.emit("start WAITING", xr_status(xr) + [
+                    (frame.bgr is not None, "image received" if frame.bgr is not None else "image NOT RECEIVED"),
+                    (keys.record_toggle, "s request pending; waiting for teleop start" if keys.record_toggle else "record toggle not requested")], repeat=True)
+            diagnostics.emit("keyboard", [(keyboard_thread.is_alive(),
+                "listener running" if keyboard_thread.is_alive() else
+                "listener STOPPED: r/s/q cannot be received; check the keyboard thread traceback and terminal stdin")],
+                repeat=not keyboard_thread.is_alive())
             time.sleep(.033)
         if keys.stop:
             return 0
 
+        diagnostic_stage = "DDS initialization"
+        logger.info("[init] DDS initialization START")
         ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+        logger.info("[init] DDS initialization returned (does not confirm robot state reception)")
         if not args.motion:
+            diagnostic_stage = "enter Debug Mode"
+            logger.info("[init] Enter Debug Mode START")
             status, _ = MotionSwitcher().Enter_Debug_Mode()
             if status != 0:
                 raise RuntimeError(f"Enter_Debug_Mode failed: {status}")
+            logger.info("[init] Enter Debug Mode OK")
+        else:
+            logger.info("[init] Enter Debug Mode skipped (--motion)")
+        diagnostic_stage = "arm IK initialization"
+        logger.info("[init] Arm IK initialization START")
         arm_ik = G1_29_ArmIK()
+        logger.info("[init] Arm IK initialization OK")
+        diagnostic_stage = "arm controller initialization"
+        logger.info("[init] Arm controller initialization START (may wait for robot state)")
         arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=False)
+        logger.info("[init] Arm controller initialization OK")
+        diagnostic_stage = "initial hand pose arrays"
         left_hand_pos_array, right_hand_pos_array = Array("d", 75), Array("d", 75)
         tele_data = xr.get_motion_state_data()
         left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -662,12 +712,23 @@ def run(args: argparse.Namespace) -> int:
         hand_lock = Lock()
         hand_states = Array("d", 14, lock=False)
         hand_actions = Array("d", 14, lock=False)
+        diagnostic_stage = "Dex3 hand controller initialization"
+        logger.info("[init] Dex3 hand controller initialization START (may wait for hand state)")
         hand_session = LegacyHandSession(Dex3_1_Controller,
             left_hand_pos_array, right_hand_pos_array, hand_lock, hand_states, hand_actions)
+        logger.info("[init] Dex3 hand controller initialization OK")
+        diagnostic_stage = "tactile subscription"
+        logger.info("[init] Tactile subscription START")
         tactile = Dex3TactileSubscriber(ChannelSubscriber, HandState_)
+        logger.info("[init] Tactile subscribers created (sensor reception not yet confirmed)")
+        diagnostic_stage = "neck forwarding initialization"
+        logger.info("[init] Neck forwarding START")
         neck = NeckPoseForwarder(xr.tvuer, args.neck_pose_ip,
                                  args.neck_pose_port, args.neck_pose_rate)
+        diagnostic_stage = "arm speed ramp initialization"
         arm_ctrl.speed_gradual_max()
+        logger.info("[teleop] Initialization complete; entering control loop.")
+        diagnostic_stage = "teleop control/recording loop"
         image_ages = []
         period = 1.0 / args.frequency
         next_tick = time.monotonic()
@@ -689,15 +750,26 @@ def run(args: argparse.Namespace) -> int:
                 if record_running:
                     record_running = False
                     recorder.save_episode()
+                    logger.info("[record] SAVE requested; sample collection stopped.")
                     logger.info(f"Episode timing: {summarize_ages(image_ages)}")
                 else:
                     record_running = recorder.create_episode()
                     image_ages = []
                     if not record_running:
                         logger.warning("Writer still saving; press s again when save completes.")
+                    else:
+                        logger.info("[record] Episode STARTED; samples are saved only when all recording conditions pass.")
 
             tele_data = xr.get_motion_state_data()
             tracking = xr.tracking_ready()
+            diagnostics.emit("tracking", [(tracking, "arm/hand target updates enabled" if tracking else
+                "arm/hand target updates PAUSED by tracking gate")] + xr_status(xr), repeat=not tracking)
+            neck_status = pose_status("head pose for neck UDP", xr.tvuer.head_received_ns.value,
+                                     "", time.monotonic_ns(), limit_ms=250.0)
+            diagnostics.emit("neck forwarding", [neck_status], repeat=neck_status[0][0] != "ready")
+            diagnostics.emit("keyboard", [(keyboard_thread.is_alive(), "listener running" if keyboard_thread.is_alive()
+                else "listener STOPPED: r/s/q cannot be received; check keyboard thread traceback and terminal stdin")],
+                repeat=not keyboard_thread.is_alive())
             observation_complete = False
             if tracking:
                 with left_hand_pos_array.get_lock():
@@ -746,6 +818,13 @@ def run(args: argparse.Namespace) -> int:
                     if freshness is None:
                         freshness = (sample_ns - image_observed_ns) / 1e6
                     observation_complete = complete_observation(frame, freshness, neck_latest, touch)
+                    diagnostics.emit("record conditions", [(observation_complete,
+                        "sample ACCEPTED" if observation_complete else "sample SKIPPED")] +
+                        observation_status(frame, freshness, neck_latest, touch) + [
+                            (timing["image_age_ms"] is not None,
+                             "image age uses PC2 clock sync" if timing["image_age_ms"] is not None else
+                             "image age uses cached-frame duration; capture latency UNKNOWN")],
+                        repeat=not observation_complete)
                     if observation_complete:
                         image_ages.append(timing["image_age_ms"])
                         recorder.add_item(colors=split_stereo(frame.bgr, shape[1]), depths={},
@@ -753,6 +832,9 @@ def run(args: argparse.Namespace) -> int:
                     if recorder.item_data_queue.qsize() > 2 * args.frequency:
                         raise RuntimeError("episode disk writer is over two seconds behind")
             if record_running and not observation_complete:
+                if not tracking:
+                    diagnostics.emit("record conditions", [(False,
+                        "sample SKIPPED: tracking gate failed; image/neck/tactile recording checks not reached")], repeat=True)
                 if time.monotonic() - last_warning > 2:
                     logger.warning("Skipping incomplete/stale sample: check Quest tracking, ZED, "
                                    "neck encoder/torque and tactile (freshness limit 500 ms).")
@@ -763,6 +845,9 @@ def run(args: argparse.Namespace) -> int:
                 time.sleep(remaining)
             else:
                 next_tick = time.monotonic()
+    except Exception:
+        logger.exception(f"[diagnostics] FAILED during {diagnostic_stage}")
+        raise
     except KeyboardInterrupt:
         logger.info("Interrupted; saving episode and stopping.")
     finally:
