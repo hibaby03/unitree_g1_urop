@@ -127,26 +127,17 @@ class LegacyStereoXR:
                 self.pose_event_diagnostics.update("head")
 
             async def on_hand_move(self, event, session, fps=60):
-                stage = "hand payload"
+                # The wrapped fork's own on_hand_move parses the Quest hand
+                # payload (its wire format is not a plain 400-float array, so
+                # pre-parsing it here wrongly rejected every real event). Let
+                # the real handler decode and populate left/right_hand_pos; only
+                # mark the hand as received when it accepts the event.
                 try:
-                    for side in ("left", "right"):
-                        stage = f"{side} hand payload"
-                        values = np.asarray(event.value[side], dtype=float)
-                        if values.shape != (400,) or not np.isfinite(values).all():
-                            reason = (f"expected shape=(400,), got shape={values.shape}"
-                                      if values.shape != (400,) else "contains NaN or infinity")
-                            self.pose_event_diagnostics.update("hand", f"{stage}: {reason}; remaining checks not run")
-                            return
-                        stage = f"{side} wrist pose"
-                        _validated_pose_matrix(values[:16].reshape(4, 4, order="F"))
-                        stage = f"{side}State"
-                        if not isinstance(event.value[side + "State"], dict):
-                            self.pose_event_diagnostics.update("hand", f"{stage}: expected dict; remaining checks not run")
-                            return
-                except (KeyError, TypeError, ValueError) as error:
-                    self.pose_event_diagnostics.update("hand", f"{stage}: {type(error).__name__}: {error}; remaining checks not run")
+                    await super().on_hand_move(event, session, fps)
+                except (KeyError, TypeError, ValueError, IndexError) as error:
+                    self.pose_event_diagnostics.update(
+                        "hand", f"{type(error).__name__}: {error}")
                     return
-                await super().on_hand_move(event, session, fps)
                 self.hand_received_ns.value = time.monotonic_ns()
                 self.pose_event_diagnostics.update("hand")
 

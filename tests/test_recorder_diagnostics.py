@@ -104,6 +104,11 @@ class FakeTeleVuer:
         self.head_calls += 1
 
     async def on_hand_move(self, event, session, fps=60):
+        # Mimic the wrapped fork: it parses the payload itself and raises on a
+        # bad one. The adapter must delegate to this and only mark received on
+        # success (pre-parsing in the adapter wrongly rejected real events).
+        if event.value.get("left") == "RAISE":
+            raise ValueError("bad hand payload")
         self.hand_calls += 1
 
 
@@ -144,23 +149,18 @@ class EventInstrumentationTests(unittest.TestCase):
         self.assertTrue(all(status[0] == "ready" for status, _ in report))
         self.assertEqual(before, (tv.head_received_ns.value, tv.hand_received_ns.value))
 
-    def test_rejections_identify_side_and_do_not_touch_accepted_timestamp(self):
+    def test_underlying_rejection_preserves_timestamp_and_records_diagnostic(self):
+        # The adapter no longer pre-parses hand data; it delegates to the real
+        # handler and only updates the timestamp when that handler accepts the
+        # event. A rejection must leave the last accepted timestamp untouched.
         self.hand()
         tv = self.xr.tvuer
         stamp = tv.hand_received_ns.value
-        for changes, expected in [
-            ({"left": []}, "left hand payload"),
-            ({"right": [float("nan")] * 400}, "right hand payload"),
-            ({"right": [0] * 400}, "right wrist pose"),
-            ({"leftState": []}, "leftState"),
-            ({"rightState": None}, "rightState"),
-        ]:
-            with self.subTest(expected=expected):
-                self.hand(**changes)
-                self.assertIn(expected, tv.pose_event_diagnostics.error("hand"))
-                self.assertEqual(tv.hand_received_ns.value, stamp)
-                self.assertEqual(tv.hand_calls, 1)
-        self.hand()
+        self.hand(left="RAISE")
+        self.assertIn("ValueError", tv.pose_event_diagnostics.error("hand"))
+        self.assertEqual(tv.hand_received_ns.value, stamp)
+        self.assertEqual(tv.hand_calls, 1)  # the raising call did not complete
+        self.hand()  # a later valid event clears the diagnostic and is counted
         self.assertEqual(tv.hand_calls, 2)
         self.assertEqual(tv.pose_event_diagnostics.error("hand"), "")
 
