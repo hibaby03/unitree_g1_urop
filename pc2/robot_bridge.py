@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""Orin-side DDS<->UDP bridge for the Host recorder.
+"""Orin DDS<->UDP bridge for the Host recorder (unitree_sdk2py only).
 
-The Host runs the recorder over Wi-Fi and cannot see the G1's DDS (arm/hand/
-tactile live on the robot's wired network). This bridge runs on the Orin, which
-is on that DDS network. It:
+The Host runs the recorder over Wi-Fi and cannot see the G1's DDS. This bridge
+runs on the Orin (on the robot's DDS network) and:
 
-- reads arm q/dq (rt/lowstate), Dex3-1 hand state/action and tactile over DDS,
-  and sends them to the Host over UDP (robot-state and tactile packets);
-- receives the Host's control command over UDP (arm target q/tau from the Host's
-  IK, and raw hand-tracking positions) and applies them to the robot over DDS
-  through the same G1_29_ArmController and Dex3_1_Controller the recorder used.
+- reads arm q/dq (rt/lowstate via the vendored G1_29 arm controller), Dex3-1
+  hand q and tactile (rt/dex3/*/state) and sends them to the Host over UDP;
+- receives the Host's control command over UDP (arm target q/tau from the Host
+  IK, and already-retargeted Dex3-1 joint q) and applies it over DDS through the
+  vendored arm controller and a raw Dex3 command publisher.
 
-Wire formats are shared verbatim with host/robot_link.py (a test asserts the
-struct formats match). Video (teleimager ZMQ) and neck (UDP) are unchanged and
-do not go through this bridge.
+It needs only unitree_sdk2py + numpy + logging_mp — not xr_teleoperate, pinocchio
+or dex_retargeting (the Host owns IK and hand retargeting). Wire formats are
+shared verbatim with host/robot_link.py and checked for equality in tests.
 """
 
 from __future__ import annotations
@@ -37,12 +36,11 @@ VERSION = 1
 
 NUM_ARM = 14
 NUM_HAND = 7
-NUM_HAND_POS = 75
 TACTILE_VALUES = 12
 
 _HEADER = "!4sBBHIQ"
 STATE_STRUCT = struct.Struct(_HEADER + f"{NUM_ARM + NUM_ARM + 4 * NUM_HAND}f")
-COMMAND_STRUCT = struct.Struct(_HEADER + f"{NUM_ARM + NUM_ARM + 2 * NUM_HAND_POS}f")
+COMMAND_STRUCT = struct.Struct(_HEADER + f"{NUM_ARM + NUM_ARM + 2 * NUM_HAND}f")
 TACTILE_HEADER = struct.Struct(_HEADER + "HH")
 TACTILE_SENSOR = struct.Struct(f"!{TACTILE_VALUES}f{TACTILE_VALUES}fi")
 
@@ -69,7 +67,6 @@ def _finite(values) -> bool:
 def encode_state(arm_q, arm_dq, left_hand_q, right_hand_q,
                  left_hand_action, right_hand_action,
                  sequence: int, pc2_monotonic_ns: int) -> bytes:
-    """arm_q/arm_dq are 14 (or empty) and each hand list is 7 (or empty)."""
     flags = 0
     arm_q, arm_dq = list(arm_q), list(arm_dq)
     if arm_q and arm_dq:
@@ -94,7 +91,6 @@ def encode_state(arm_q, arm_dq, left_hand_q, right_hand_q,
 
 def encode_tactile(left: Optional[dict], right: Optional[dict],
                    sequence: int, pc2_monotonic_ns: int) -> bytes:
-    """left/right are {"pressure": [[12]...], "temperature": [[12]...], "lost": [...]} or None."""
     def sensors(sample):
         if not sample or not sample.get("pressure"):
             return []
@@ -128,32 +124,30 @@ def decode_command(datagram: bytes) -> dict:
     magic, version, flags, _reserved, sequence, timestamp, *values = COMMAND_STRUCT.unpack(datagram)
     if magic != COMMAND_MAGIC or version != VERSION:
         raise RobotBridgeError("bad command magic/version")
-    arm_q = values[0:NUM_ARM]
-    arm_tau = values[NUM_ARM:2 * NUM_ARM]
-    rest = values[2 * NUM_ARM:]
-    left_hand_pos = rest[0:NUM_HAND_POS]
-    right_hand_pos = rest[NUM_HAND_POS:2 * NUM_HAND_POS]
-    return {"arm_q": list(arm_q), "arm_tau": list(arm_tau),
-            "left_hand_pos": list(left_hand_pos), "right_hand_pos": list(right_hand_pos),
+    return {"arm_q": list(values[0:NUM_ARM]),
+            "arm_tau": list(values[NUM_ARM:2 * NUM_ARM]),
+            "left_hand_q": list(values[2 * NUM_ARM:2 * NUM_ARM + NUM_HAND]),
+            "right_hand_q": list(values[2 * NUM_ARM + NUM_HAND:2 * NUM_ARM + 2 * NUM_HAND]),
             "flags": flags, "sequence": sequence, "host_monotonic_ns": timestamp}
 
 
 # --- argument parsing --------------------------------------------------------
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Orin DDS<->UDP bridge for the Host recorder.")
-    parser.add_argument("--xr-repo", default="~/hckang/xr_teleoperate")
+    parser = argparse.ArgumentParser(description="Orin DDS<->UDP bridge (unitree_sdk2py only).")
     parser.add_argument("--interface", default="eth0", help="DDS network interface (e.g. eth0)")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain id")
     parser.add_argument("--host-ip", default="192.168.50.7", help="Host address to send robot state to")
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
     parser.add_argument("--command-port", type=int, default=DEFAULT_COMMAND_PORT)
-    parser.add_argument("--state-rate", type=float, default=60.0, help="robot-state send rate [Hz]")
+    parser.add_argument("--state-rate", type=float, default=90.0, help="robot-state send rate [Hz]")
     parser.add_argument("--tactile-rate", type=float, default=30.0, help="tactile send rate [Hz]")
     parser.add_argument("--command-timeout-ms", type=float, default=500.0,
-                        help="hold the last command, then stop arm motion, after this silence")
+                        help="log when Host commands stop; the arm then holds its last pose")
     parser.add_argument("--motion", action="store_true",
                         help="robot is in motion mode; skip entering debug mode")
+    parser.add_argument("--no-arm", action="store_true",
+                        help="relay state/tactile and hand only; do not command the arm")
     parser.add_argument("--check", action="store_true",
                         help="verify imports/APIs without touching the robot")
     args = parser.parse_args(argv)
@@ -166,52 +160,46 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return args
 
 
+def enter_debug_mode() -> None:
+    """Release any running locomotion mode so arm_sdk/lowcmd takes effect."""
+    from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+
+    client = MotionSwitcherClient()
+    client.SetTimeout(1.0)
+    client.Init()
+    _status, result = client.CheckMode()
+    while result and result.get("name"):
+        client.ReleaseMode()
+        _status, result = client.CheckMode()
+        time.sleep(1)
+
+
 # --- main --------------------------------------------------------------------
 
 def run(args: argparse.Namespace) -> int:
-    from pathlib import Path
-
-    repository = Path(args.xr_repo).expanduser().resolve()
-    teleop_dir = repository / "teleop"
-    if not (teleop_dir / "teleop_hand_and_arm.py").is_file():
-        raise FileNotFoundError(f"xr_teleoperate teleop directory not found: {teleop_dir}")
-    sys.path.insert(0, str(repository))
-    os.chdir(teleop_dir)
-
-    from multiprocessing import Array, Lock
-    from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
-    from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandState_
-    from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_JointArmIndex
-    from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller
-    from teleop.utils.motion_switcher import MotionSwitcher
-
     try:
-        from .dex3_tactile import Dex3TactileSubscriber  # optional shared helper
-    except Exception:
-        # The tactile reader is small; inline a local copy to avoid a new import
-        # dependency on the recorder module layout.
-        from teleop_record_dex3_tactile import Dex3TactileSubscriber  # type: ignore
+        from .g1_arm_control import G1_29_ArmController, G1_29_JointArmIndex
+        from .dex3_control import Dex3CommandPublisher, Dex3StateReader, MAX_DELTA_Q_PER_CYCLE
+    except ImportError:
+        from g1_arm_control import G1_29_ArmController, G1_29_JointArmIndex  # type: ignore
+        from dex3_control import Dex3CommandPublisher, Dex3StateReader, MAX_DELTA_Q_PER_CYCLE  # type: ignore
 
     if args.check:
-        print("robot_bridge: imports OK; "
-              f"state->{args.host_ip}:{args.state_port}, commands<-:{args.command_port}")
+        print(f"robot_bridge: imports OK; state->{args.host_ip}:{args.state_port}, "
+              f"commands<-:{args.command_port}, interface {args.interface}")
         return 0
 
-    ChannelFactoryInitialize(args.domain, networkInterface=args.interface)
+    import numpy as np
+    from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+
+    os.environ["UNITREE_NETWORK_INTERFACE"] = args.interface
+    ChannelFactoryInitialize(args.domain, args.interface)
     if not args.motion:
-        status, _ = MotionSwitcher().Enter_Debug_Mode()
-        if status != 0:
-            raise RobotBridgeError(f"Enter_Debug_Mode failed: {status}")
+        enter_debug_mode()
 
     arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=False)
-    hand_lock = Lock()
-    left_hand_pos = Array("d", NUM_HAND_POS, lock=True)
-    right_hand_pos = Array("d", NUM_HAND_POS, lock=True)
-    hand_state = Array("d", 2 * DEX3_NUM_MOTORS, lock=False)
-    hand_action = Array("d", 2 * DEX3_NUM_MOTORS, lock=False)
-    Dex3_1_Controller(left_hand_pos, right_hand_pos, hand_lock, hand_state, hand_action,
-                      simulation_mode=False)
-    tactile = Dex3TactileSubscriber(ChannelSubscriber, HandState_)
+    hand_pub = Dex3CommandPublisher()
+    hand_reader = Dex3StateReader()
     arm_ctrl.speed_gradual_max()
 
     command_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -221,13 +209,10 @@ def run(args: argparse.Namespace) -> int:
     send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     state_addr = (args.host_ip, args.state_port)
 
-    import numpy as np
-
     stop = threading.Event()
     last_command_ns = [0]
 
     def command_loop() -> None:
-        # Apply commands as they arrive to keep control latency low.
         while not stop.is_set():
             try:
                 datagram, _ = command_socket.recvfrom(4096)
@@ -242,11 +227,17 @@ def run(args: argparse.Namespace) -> int:
             except RobotBridgeError:
                 continue
             if command["flags"] & COMMAND_FLAG_HAND:
-                with left_hand_pos.get_lock():
-                    left_hand_pos[:] = command["left_hand_pos"]
-                with right_hand_pos.get_lock():
-                    right_hand_pos[:] = command["right_hand_pos"]
-            if command["flags"] & COMMAND_FLAG_ARM:
+                # Slew-limit hand q against the measured state, like Dex3_1_Controller.
+                left_now, right_now = hand_reader.joints()
+                left_q, right_q = command["left_hand_q"], command["right_hand_q"]
+                if left_now is not None:
+                    left_q = np.clip(left_q, np.subtract(left_now, MAX_DELTA_Q_PER_CYCLE),
+                                     np.add(left_now, MAX_DELTA_Q_PER_CYCLE))
+                if right_now is not None:
+                    right_q = np.clip(right_q, np.subtract(right_now, MAX_DELTA_Q_PER_CYCLE),
+                                      np.add(right_now, MAX_DELTA_Q_PER_CYCLE))
+                hand_pub.send(left_q, right_q)
+            if not args.no_arm and command["flags"] & COMMAND_FLAG_ARM:
                 arm_ctrl.ctrl_dual_arm(np.asarray(command["arm_q"]), np.asarray(command["arm_tau"]))
             last_command_ns[0] = time.monotonic_ns()
 
@@ -258,35 +249,35 @@ def run(args: argparse.Namespace) -> int:
     tactile_period = 1.0 / args.tactile_rate
     next_state = next_tactile = time.monotonic()
     timeout_ns = args.command_timeout_ms * 1e6
-    print(f"robot_bridge: state->{state_addr}, commands<-0.0.0.0:{args.command_port}", flush=True)
+    print(f"robot_bridge: state->{state_addr}, commands<-0.0.0.0:{args.command_port}, "
+          f"arm {'OFF' if args.no_arm else 'ON'}", flush=True)
     try:
         while True:
             now = time.monotonic()
             if now >= next_state:
                 next_state += state_period
-                lowstate = arm_ctrl.lowstate_buffer.GetData()
-                arm_q = [lowstate.motor_state[j].q for j in G1_29_JointArmIndex]
-                arm_dq = [lowstate.motor_state[j].dq for j in G1_29_JointArmIndex]
-                with hand_lock:
-                    state_values = list(hand_state[:])
-                    action_values = list(hand_action[:])
-                n = DEX3_NUM_MOTORS
+                arm_q = list(arm_ctrl.get_current_dual_arm_q())
+                arm_dq = list(arm_ctrl.get_current_dual_arm_dq())
+                left_q, right_q = hand_reader.joints()
+                have_hand = left_q is not None and right_q is not None
                 state_seq += 1
                 send_socket.sendto(encode_state(
-                    arm_q, arm_dq, state_values[:n], state_values[n:],
-                    action_values[:n], action_values[n:], state_seq, time.monotonic_ns()), state_addr)
+                    arm_q, arm_dq,
+                    left_q or [], right_q or [],
+                    # No separate retargeted action is read back; the measured q
+                    # doubles as action here (Host records its own sent command).
+                    left_q or [], right_q or [],
+                    state_seq, time.monotonic_ns()) if have_hand else encode_state(
+                    arm_q, arm_dq, [], [], [], [], state_seq, time.monotonic_ns()), state_addr)
             if now >= next_tactile:
                 next_tactile += tactile_period
-                touch = tactile.snapshot()
+                left_t, right_t = hand_reader.tactile()
                 tactile_seq += 1
-                send_socket.sendto(encode_tactile(
-                    touch.get("left_ee"), touch.get("right_ee"), tactile_seq,
-                    time.monotonic_ns()), state_addr)
-            # If the Host stops commanding, let the arm hold; a longer silence is
-            # a link failure the operator must see rather than drive blind.
+                send_socket.sendto(encode_tactile(left_t, right_t, tactile_seq,
+                                                  time.monotonic_ns()), state_addr)
             if last_command_ns[0] and (time.monotonic_ns() - last_command_ns[0]) > timeout_ns:
-                print("robot_bridge: no command for "
-                      f"{args.command_timeout_ms:.0f} ms (holding last pose)", flush=True)
+                print(f"robot_bridge: no command for {args.command_timeout_ms:.0f} ms "
+                      "(arm holding last pose)", flush=True)
                 last_command_ns[0] = 0
             time.sleep(min(state_period, tactile_period) / 2)
     except KeyboardInterrupt:
@@ -298,6 +289,7 @@ def run(args: argparse.Namespace) -> int:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as error:
             print(f"robot_bridge: arm home failed: {error}", file=sys.stderr)
+        hand_reader.close()
         command_socket.close()
         send_socket.close()
     return 0

@@ -44,6 +44,7 @@ try:
     from .recorder_diagnostics import TerminalDiagnostics, xr_status, pose_status, observation_status
     from .zmq_stereo_vr import resolve_tls
     from .robot_link import RobotLink
+    from .hand_retarget import HandRetarget
 except ImportError:
     from frame_timing import (  # type: ignore[no-redef]
         DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader, frame_timing_entry)
@@ -54,6 +55,7 @@ except ImportError:
     from recorder_diagnostics import TerminalDiagnostics, xr_status, pose_status, observation_status
     from zmq_stereo_vr import resolve_tls
     from robot_link import RobotLink  # type: ignore[no-redef]
+    from hand_retarget import HandRetarget  # type: ignore[no-redef]
 
 
 DEX3_NUM_MOTORS = 7
@@ -643,7 +645,7 @@ def run(args: argparse.Namespace) -> int:
     keys = KeyState(logger.info, record_enabled=args.record)
     diagnostics = TerminalDiagnostics(logger.info)
     img_client = clock_sync = xr = neck = neck_state = tactile = None
-    arm_ctrl = recorder = hand_session = keyboard_thread = link = None
+    arm_ctrl = recorder = hand_session = keyboard_thread = link = hand_retarget = None
     bridge = args.bridge_ip is not None
     record_running = False
     cleanup_errors = []
@@ -708,6 +710,7 @@ def run(args: argparse.Namespace) -> int:
             logger.info(f"[init] Robot bridge link START (bridge {args.bridge_ip})")
             link = RobotLink(args.bridge_ip, state_port=args.bridge_state_port,
                              command_port=args.bridge_command_port)
+            hand_retarget = HandRetarget()  # Host does Dex3-1 retargeting in bridge mode
             logger.info("[init] Robot bridge link OK (robot state reception not yet confirmed)")
         else:
             diagnostic_stage = "DDS initialization"
@@ -800,13 +803,16 @@ def run(args: argparse.Namespace) -> int:
                 left_hand_pos = np.asarray(tele_data.left_hand_pos).flatten()
                 right_hand_pos = np.asarray(tele_data.right_hand_pos).flatten()
                 have_robot = True
+                left_hand_q = right_hand_q = None
                 if bridge:
-                    # arm/hand/tactile come from the Orin bridge over UDP.
+                    # arm/hand/tactile come from the Orin bridge over UDP; the
+                    # Host retargets the hand and sends joint q to the bridge.
+                    left_hand_q, right_hand_q = hand_retarget.retarget(left_hand_pos, right_hand_pos)
                     robot_state, _ = link.latest_state()
                     if robot_state is not None and robot_state.arm_q and robot_state.left_hand_q:
                         arm_q, arm_dq = robot_state.arm_q, robot_state.arm_dq
                         hand_state = robot_state.left_hand_q + robot_state.right_hand_q
-                        hand_action = robot_state.left_hand_action + robot_state.right_hand_action
+                        hand_action = left_hand_q + right_hand_q  # what the Host commanded
                     else:
                         have_robot = False
                     arm_read_ns = hand_read_ns = time.monotonic_ns()
@@ -841,7 +847,7 @@ def run(args: argparse.Namespace) -> int:
                         tele_data.left_arm_pose, tele_data.right_arm_pose,
                         np.asarray(arm_q), np.asarray(arm_dq))
                     if bridge:
-                        link.send_command(sol_q, sol_tauff, left_hand_pos, right_hand_pos)
+                        link.send_command(sol_q, sol_tauff, left_hand_q, right_hand_q)
                     else:
                         arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
                     action_ns = time.monotonic_ns()

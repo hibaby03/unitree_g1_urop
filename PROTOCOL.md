@@ -156,10 +156,10 @@ zero-filled).
 right_count) + per sensor `!12f12fi` (pressure[12], temperature[12], lost). The
 Host stamps age on arrival.
 
-**Robot command — Host -> Orin, UDP 5009, magic `ARCM`:** header + `178f` =
-arm_target_q[14] (Host IK result), arm_tauff[14], left_hand_pos[75],
-right_hand_pos[75] (Quest hand-tracking landmarks; the Orin retargets them).
-flags bit0 arm valid, bit1 hand valid.
+**Robot command — Host -> Orin, UDP 5009, magic `ARCM`:** header + `42f` =
+arm_target_q[14] (Host IK result), arm_tauff[14], left_hand_q[7], right_hand_q[7]
+(Dex3-1 joint targets; the Host does IK and hand retargeting, the Orin only
+publishes). flags bit0 arm valid, bit1 hand valid.
 
 Control latency gains one Wi-Fi hop versus direct DDS. The bridge holds the last
 arm pose if Host commands stop; a long silence is logged for the operator.

@@ -33,13 +33,12 @@ VERSION = 1
 
 NUM_ARM = 14          # 7 left + 7 right
 NUM_HAND = 7          # per hand
-NUM_HAND_POS = 75     # 25 landmarks * 3, one hand of Quest hand tracking
 TACTILE_VALUES = 12   # pressure or temperature values per press sensor
 
 # header: magic(4s) version(B) flags(B) reserved(H) sequence(I) timestamp_ns(Q)
 _HEADER = "!4sBBHIQ"
 STATE_STRUCT = struct.Struct(_HEADER + f"{NUM_ARM + NUM_ARM + 4 * NUM_HAND}f")
-COMMAND_STRUCT = struct.Struct(_HEADER + f"{NUM_ARM + NUM_ARM + 2 * NUM_HAND_POS}f")
+COMMAND_STRUCT = struct.Struct(_HEADER + f"{NUM_ARM + NUM_ARM + 2 * NUM_HAND}f")
 TACTILE_HEADER = struct.Struct(_HEADER + "HH")  # + left_count, right_count
 TACTILE_SENSOR = struct.Struct(f"!{TACTILE_VALUES}f{TACTILE_VALUES}fi")  # pressure, temp, lost
 
@@ -132,17 +131,18 @@ def decode_tactile(datagram: bytes) -> dict:
 
 # --- robot command (Host -> Orin) -------------------------------------------
 
-def encode_command(arm_target_q, arm_tauff, left_hand_pos, right_hand_pos,
+def encode_command(arm_target_q, arm_tauff, left_hand_q, right_hand_q,
                    sequence: int, host_monotonic_ns: int) -> bytes:
+    """left_hand_q/right_hand_q are the Host-retargeted Dex3-1 joint targets (7 each)."""
     arm_target_q = list(arm_target_q)
     arm_tauff = list(arm_tauff)
-    left_hand_pos = list(left_hand_pos)
-    right_hand_pos = list(right_hand_pos)
+    left_hand_q = list(left_hand_q)
+    right_hand_q = list(right_hand_q)
     if len(arm_target_q) != NUM_ARM or len(arm_tauff) != NUM_ARM:
         raise RobotLinkError("arm command must have 14 q and 14 tau")
-    if len(left_hand_pos) != NUM_HAND_POS or len(right_hand_pos) != NUM_HAND_POS:
-        raise RobotLinkError("hand positions must have 75 values each")
-    payload = arm_target_q + arm_tauff + left_hand_pos + right_hand_pos
+    if len(left_hand_q) != NUM_HAND or len(right_hand_q) != NUM_HAND:
+        raise RobotLinkError("hand command must have 7 q per hand")
+    payload = arm_target_q + arm_tauff + left_hand_q + right_hand_q
     if not _finite(payload):
         raise RobotLinkError("command contains a non-finite value")
     flags = COMMAND_FLAG_ARM | COMMAND_FLAG_HAND
@@ -220,9 +220,9 @@ class RobotLink:
                     result[key] = {**sample, "age_ms": round((now - self._tactile_ns) / 1e6, 3)}
             return result
 
-    def send_command(self, arm_target_q, arm_tauff, left_hand_pos, right_hand_pos) -> None:
+    def send_command(self, arm_target_q, arm_tauff, left_hand_q, right_hand_q) -> None:
         self._command_sequence = (self._command_sequence + 1) & 0xFFFFFFFF
-        datagram = encode_command(arm_target_q, arm_tauff, left_hand_pos, right_hand_pos,
+        datagram = encode_command(arm_target_q, arm_tauff, left_hand_q, right_hand_q,
                                   self._command_sequence, time.monotonic_ns())
         self._send.sendto(datagram, self._command_addr)
 

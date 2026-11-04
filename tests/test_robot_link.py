@@ -12,7 +12,6 @@ LH_Q = [0.2 * i for i in range(7)]
 RH_Q = [0.3 * i for i in range(7)]
 LH_A = [0.4 * i for i in range(7)]
 RH_A = [0.5 * i for i in range(7)]
-HAND_POS = [0.01 * i for i in range(75)]
 
 
 def make_tactile(offset):
@@ -26,7 +25,7 @@ class WireFormatMatchTests(unittest.TestCase):
         for name in ("STATE_STRUCT", "COMMAND_STRUCT", "TACTILE_HEADER", "TACTILE_SENSOR"):
             self.assertEqual(getattr(host, name).format, getattr(pc2, name).format, name)
         for name in ("STATE_MAGIC", "TACTILE_MAGIC", "COMMAND_MAGIC", "VERSION",
-                     "NUM_ARM", "NUM_HAND", "NUM_HAND_POS", "TACTILE_VALUES",
+                     "NUM_ARM", "NUM_HAND", "TACTILE_VALUES",
                      "DEFAULT_STATE_PORT", "DEFAULT_COMMAND_PORT"):
             self.assertEqual(getattr(host, name), getattr(pc2, name), name)
 
@@ -83,18 +82,20 @@ class TactileRoundTripTests(unittest.TestCase):
 
 class CommandRoundTripTests(unittest.TestCase):
     def test_full_command(self):
-        packet = host.encode_command(ARM_Q, ARM_DQ, HAND_POS, HAND_POS, 4, 11)
+        packet = host.encode_command(ARM_Q, ARM_DQ, LH_Q, RH_Q, 4, 11)
         command = pc2.decode_command(packet)
         self.assertEqual(command["sequence"], 4)
         self.assertEqual(command["host_monotonic_ns"], 11)
         self.assertEqual([round(v, 5) for v in command["arm_q"]], [round(v, 5) for v in ARM_Q])
-        self.assertEqual(len(command["left_hand_pos"]), 75)
+        self.assertEqual([round(v, 5) for v in command["arm_tau"]], [round(v, 5) for v in ARM_DQ])
+        self.assertEqual([round(v, 5) for v in command["left_hand_q"]], [round(v, 5) for v in LH_Q])
+        self.assertEqual(len(command["right_hand_q"]), 7)
 
     def test_rejects_wrong_sizes(self):
         with self.assertRaises(host.RobotLinkError):
-            host.encode_command(ARM_Q[:3], ARM_DQ, HAND_POS, HAND_POS, 1, 1)
+            host.encode_command(ARM_Q[:3], ARM_DQ, LH_Q, RH_Q, 1, 1)
         with self.assertRaises(host.RobotLinkError):
-            host.encode_command(ARM_Q, ARM_DQ, HAND_POS[:10], HAND_POS, 1, 1)
+            host.encode_command(ARM_Q, ARM_DQ, LH_Q[:3], RH_Q, 1, 1)
 
 
 class RobotLinkLoopbackTests(unittest.TestCase):
@@ -125,10 +126,11 @@ class RobotLinkLoopbackTests(unittest.TestCase):
             port = bridge.getsockname()[1]
             link = host.RobotLink("127.0.0.1", state_port=0, command_port=port)
             self.addCleanup(link.close)
-            link.send_command(ARM_Q, ARM_DQ, HAND_POS, HAND_POS)
+            link.send_command(ARM_Q, ARM_DQ, LH_Q, RH_Q)
             datagram, _ = bridge.recvfrom(4096)
         command = pc2.decode_command(datagram)
         self.assertEqual(len(command["arm_q"]), 14)
+        self.assertEqual(len(command["left_hand_q"]), 7)
 
 
 if __name__ == "__main__":
