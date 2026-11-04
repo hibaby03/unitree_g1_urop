@@ -5,27 +5,39 @@ Host/PC2 실행 시 `NECK_TRACE_DIR`를 지정하면 구간별 시간과 자세�
 계측용 시계 오프셋 측정은 UDP 5010을 사용하며 기본 제어 패킷과 제어 순서는 유지한다.
 Host에는 `host/`만, PC2에는 `pc2/`만 복사하면 된다. 추가 공용 폴더는 필요 없다.
 
-## 빠른 실행 (영상 + 목 추종)
+## 빠른 실행
 
-현재 네트워크: Host `192.168.50.3`, 로봇/PC2 `192.168.50.9`. 아래 기본값에
-이미 반영돼 있어 주소를 따로 넣지 않는다.
+현재 네트워크: Host(Wi-Fi) `192.168.50.7`, 로봇/PC2(Orin) `192.168.50.9`.
+Host는 Wi-Fi로만 PC2에 붙어 로봇 DDS를 직접 못 보므로, 팔·손·tactile은
+PC2의 `robot_bridge.py`가 UDP로 중계한다. 아래 기본값에 이미 반영돼 있다.
 
+### 영상 + 목만 보기
 ```bash
-# --- PC2 (로봇) 터미널 1: ZED stereo 영상 서버 ---
+# PC2 터미널 1: ZED 영상 서버
 python3 pc2/zed_teleimager_server.py
-
-# --- PC2 (로봇) 터미널 2: 목 모터 (처음엔 15도 제한으로 안전하게) ---
-python3 pc2/head_pose_receiver.py --enable-motor \
-  --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
-
-# --- Host 터미널: Quest 화면 + 목 추종 ---
+# PC2 터미널 2: 목 모터 (enable-motor 기본 on; 처음엔 15도 제한)
+python3 pc2/head_pose_receiver.py --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
+# Host: Quest 화면 + 목 추종
 python active_camera_host/zmq_stereo_vr.py
+```
+
+### 팔·손·목 + 녹화 (브리지 모드)
+```bash
+# PC2 터미널 1: ZED 영상 서버
+python3 pc2/zed_teleimager_server.py
+# PC2 터미널 2: 목 모터
+python3 pc2/head_pose_receiver.py --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
+# PC2 터미널 3: 로봇 DDS<->UDP 브리지 (host-ip/interface 기본값 사용)
+python3 pc2/robot_bridge.py
+# Host: 녹화기 (브리지 모드)
+python3 active_camera_host/teleop_record_dex3_tactile.py --xr-repo "$HOME/hckang/xr_teleoperate" \
+  --bridge-ip 192.168.50.9 --headless
 ```
 
 그다음 Quest 브라우저에서 접속하고 **Enter VR**:
 
 ```text
-https://192.168.50.3:8012/?ws=wss://192.168.50.3:8012
+https://192.168.50.7:8012/?ws=wss://192.168.50.7:8012
 ```
 
 - 목 수신기는 켜는 즉시 **현재 위치를 goal로 잡고 토크를 유지**하므로 처지지 않고,

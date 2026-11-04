@@ -115,8 +115,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     motor = parser.add_argument_group("2XL430 motor output")
     motor.add_argument(
         "--enable-motor",
-        action="store_true",
-        help="actually enable torque and write goals; omitted means monitor-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable torque and write goals (default); --no-enable-motor for monitor-only",
     )
     motor.add_argument("--dxl-device", default="/dev/ttyUSB0")
     motor.add_argument("--dxl-baudrate", type=int, default=57600)

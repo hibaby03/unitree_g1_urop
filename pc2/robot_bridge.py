@@ -143,9 +143,9 @@ def decode_command(datagram: bytes) -> dict:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Orin DDS<->UDP bridge for the Host recorder.")
     parser.add_argument("--xr-repo", default="~/hckang/xr_teleoperate")
-    parser.add_argument("--interface", default=None, help="DDS network interface (e.g. eth0)")
+    parser.add_argument("--interface", default="eth0", help="DDS network interface (e.g. eth0)")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain id")
-    parser.add_argument("--host-ip", required=True, help="Host address to send robot state to")
+    parser.add_argument("--host-ip", default="192.168.50.7", help="Host address to send robot state to")
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
     parser.add_argument("--command-port", type=int, default=DEFAULT_COMMAND_PORT)
     parser.add_argument("--state-rate", type=float, default=60.0, help="robot-state send rate [Hz]")
