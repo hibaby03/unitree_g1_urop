@@ -135,3 +135,31 @@ host_time(pc2_ns) = pc2_ns - offset
 The Host keeps the lowest-delay sample from roughly the last 8 seconds; its
 error is at most `delay / 2`. Replies whose sequence or echoed t0 do not match
 the outstanding request are discarded.
+
+# Robot bridge packets v1 (Orin <-> Host, UDP)
+
+When the Host cannot reach the robot's DDS network, `pc2/robot_bridge.py` runs on
+the Orin (on that network) and exchanges arm/hand/tactile with the Host recorder
+over UDP. `host/robot_link.py` is the Host end. Network byte order; the struct
+formats are shared verbatim and checked for equality in tests. Video (teleimager
+ZMQ) and neck (UDP 5005/5006) do not use this bridge.
+
+Common header `!4sBBHIQ`: magic, version `1`, flags, reserved `0`, sequence,
+timestamp_ns (sender `time.monotonic_ns()`).
+
+**Robot state — Orin -> Host, UDP 5008, magic `ARST`:** header + `56f` =
+arm_q[14], arm_dq[14], left_hand_q[7], right_hand_q[7], left_hand_action[7],
+right_hand_action[7]. flags bit0 arm valid, bit1 hand valid (invalid groups are
+zero-filled).
+
+**Tactile — Orin -> Host, UDP 5008, magic `ATAC`:** header + `HH` (left_count,
+right_count) + per sensor `!12f12fi` (pressure[12], temperature[12], lost). The
+Host stamps age on arrival.
+
+**Robot command — Host -> Orin, UDP 5009, magic `ARCM`:** header + `178f` =
+arm_target_q[14] (Host IK result), arm_tauff[14], left_hand_pos[75],
+right_hand_pos[75] (Quest hand-tracking landmarks; the Orin retargets them).
+flags bit0 arm valid, bit1 hand valid.
+
+Control latency gains one Wi-Fi hop versus direct DDS. The bridge holds the last
+arm pose if Host commands stop; a long silence is logged for the operator.

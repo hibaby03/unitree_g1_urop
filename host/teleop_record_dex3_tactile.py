@@ -43,6 +43,7 @@ try:
     from .xr_legacy import LegacyStereoXR, LegacyHandSession, check_legacy_api, installed_versions
     from .recorder_diagnostics import TerminalDiagnostics, xr_status, pose_status, observation_status
     from .zmq_stereo_vr import resolve_tls
+    from .robot_link import RobotLink
 except ImportError:
     from frame_timing import (  # type: ignore[no-redef]
         DEFAULT_SYNC_PORT, ClockSyncClient, StampedFrameReader, frame_timing_entry)
@@ -52,6 +53,7 @@ except ImportError:
     from xr_legacy import LegacyStereoXR, LegacyHandSession, check_legacy_api, installed_versions
     from recorder_diagnostics import TerminalDiagnostics, xr_status, pose_status, observation_status
     from zmq_stereo_vr import resolve_tls
+    from robot_link import RobotLink  # type: ignore[no-redef]
 
 
 DEX3_NUM_MOTORS = 7
@@ -97,7 +99,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--no-clock-sync", action="store_true",
                         help="do not probe the PC2 clock; timing ages are recorded as null")
     parser.add_argument("--network-interface", default=None,
-                        help="DDS network interface, e.g. eth0")
+                        help="DDS network interface, e.g. eth0 (direct mode only)")
+    parser.add_argument("--bridge-ip", default=None,
+                        help="Orin robot_bridge address; use the UDP bridge for arm/hand/tactile "
+                             "instead of direct DDS (for a Host that cannot reach the robot DDS net)")
+    parser.add_argument("--bridge-state-port", type=int, default=5008,
+                        help="UDP port the bridge sends robot state/tactile to")
+    parser.add_argument("--bridge-command-port", type=int, default=5009,
+                        help="UDP port the bridge receives control commands on")
     parser.add_argument("--motion", action="store_true",
                         help="robot is in motion (locomotion) mode; skip entering debug mode")
     parser.add_argument("--headless", action="store_true", help="disable rerun visualization")
@@ -630,7 +639,8 @@ def run(args: argparse.Namespace) -> int:
     keys = KeyState(logger.info, record_enabled=args.record)
     diagnostics = TerminalDiagnostics(logger.info)
     img_client = clock_sync = xr = neck = neck_state = tactile = None
-    arm_ctrl = recorder = hand_session = keyboard_thread = None
+    arm_ctrl = recorder = hand_session = keyboard_thread = link = None
+    bridge = args.bridge_ip is not None
     record_running = False
     cleanup_errors = []
     diagnostic_stage = "image/XR/recorder initialization"
@@ -683,50 +693,60 @@ def run(args: argparse.Namespace) -> int:
         if keys.stop:
             return 0
 
-        diagnostic_stage = "DDS initialization"
-        logger.info("[init] DDS initialization START")
-        ChannelFactoryInitialize(0, networkInterface=args.network_interface)
-        logger.info("[init] DDS initialization returned (does not confirm robot state reception)")
-        if not args.motion:
-            diagnostic_stage = "enter Debug Mode"
-            logger.info("[init] Enter Debug Mode START")
-            status, _ = MotionSwitcher().Enter_Debug_Mode()
-            if status != 0:
-                raise RuntimeError(f"Enter_Debug_Mode failed: {status}")
-            logger.info("[init] Enter Debug Mode OK")
-        else:
-            logger.info("[init] Enter Debug Mode skipped (--motion)")
         diagnostic_stage = "arm IK initialization"
         logger.info("[init] Arm IK initialization START")
-        arm_ik = G1_29_ArmIK()
+        arm_ik = G1_29_ArmIK()  # IK runs on the Host in both modes
         logger.info("[init] Arm IK initialization OK")
-        diagnostic_stage = "arm controller initialization"
-        logger.info("[init] Arm controller initialization START (may wait for robot state)")
-        arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=False)
-        logger.info("[init] Arm controller initialization OK")
-        diagnostic_stage = "initial hand pose arrays"
-        left_hand_pos_array, right_hand_pos_array = Array("d", 75), Array("d", 75)
-        tele_data = xr.get_motion_state_data()
-        left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
-        right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
-        hand_lock = Lock()
-        hand_states = Array("d", 14, lock=False)
-        hand_actions = Array("d", 14, lock=False)
-        diagnostic_stage = "Dex3 hand controller initialization"
-        logger.info("[init] Dex3 hand controller initialization START (may wait for hand state)")
-        hand_session = LegacyHandSession(Dex3_1_Controller,
-            left_hand_pos_array, right_hand_pos_array, hand_lock, hand_states, hand_actions)
-        logger.info("[init] Dex3 hand controller initialization OK")
-        diagnostic_stage = "tactile subscription"
-        logger.info("[init] Tactile subscription START")
-        tactile = Dex3TactileSubscriber(ChannelSubscriber, HandState_)
-        logger.info("[init] Tactile subscribers created (sensor reception not yet confirmed)")
+        if bridge:
+            # The Orin runs DDS, the arm/hand controllers and tactile; the Host
+            # exchanges arm/hand/tactile over UDP with pc2/robot_bridge.py.
+            diagnostic_stage = "robot bridge link initialization"
+            logger.info(f"[init] Robot bridge link START (bridge {args.bridge_ip})")
+            link = RobotLink(args.bridge_ip, state_port=args.bridge_state_port,
+                             command_port=args.bridge_command_port)
+            logger.info("[init] Robot bridge link OK (robot state reception not yet confirmed)")
+        else:
+            diagnostic_stage = "DDS initialization"
+            logger.info("[init] DDS initialization START")
+            ChannelFactoryInitialize(0, networkInterface=args.network_interface)
+            logger.info("[init] DDS initialization returned (does not confirm robot state reception)")
+            if not args.motion:
+                diagnostic_stage = "enter Debug Mode"
+                logger.info("[init] Enter Debug Mode START")
+                status, _ = MotionSwitcher().Enter_Debug_Mode()
+                if status != 0:
+                    raise RuntimeError(f"Enter_Debug_Mode failed: {status}")
+                logger.info("[init] Enter Debug Mode OK")
+            else:
+                logger.info("[init] Enter Debug Mode skipped (--motion)")
+            diagnostic_stage = "arm controller initialization"
+            logger.info("[init] Arm controller initialization START (may wait for robot state)")
+            arm_ctrl = G1_29_ArmController(motion_mode=args.motion, simulation_mode=False)
+            logger.info("[init] Arm controller initialization OK")
+            diagnostic_stage = "initial hand pose arrays"
+            left_hand_pos_array, right_hand_pos_array = Array("d", 75), Array("d", 75)
+            tele_data = xr.get_motion_state_data()
+            left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
+            right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+            hand_lock = Lock()
+            hand_states = Array("d", 14, lock=False)
+            hand_actions = Array("d", 14, lock=False)
+            diagnostic_stage = "Dex3 hand controller initialization"
+            logger.info("[init] Dex3 hand controller initialization START (may wait for hand state)")
+            hand_session = LegacyHandSession(Dex3_1_Controller,
+                left_hand_pos_array, right_hand_pos_array, hand_lock, hand_states, hand_actions)
+            logger.info("[init] Dex3 hand controller initialization OK")
+            diagnostic_stage = "tactile subscription"
+            logger.info("[init] Tactile subscription START")
+            tactile = Dex3TactileSubscriber(ChannelSubscriber, HandState_)
+            logger.info("[init] Tactile subscribers created (sensor reception not yet confirmed)")
         diagnostic_stage = "neck forwarding initialization"
         logger.info("[init] Neck forwarding START")
         neck = NeckPoseForwarder(xr.tvuer, args.neck_pose_ip,
                                  args.neck_pose_port, args.neck_pose_rate)
-        diagnostic_stage = "arm speed ramp initialization"
-        arm_ctrl.speed_gradual_max()
+        if not bridge:
+            diagnostic_stage = "arm speed ramp initialization"
+            arm_ctrl.speed_gradual_max()
         logger.info("[teleop] Initialization complete; entering control loop.")
         diagnostic_stage = "teleop control/recording loop"
         image_ages = []
@@ -772,65 +792,89 @@ def run(args: argparse.Namespace) -> int:
                 repeat=not keyboard_thread.is_alive())
             observation_complete = False
             if tracking:
-                with left_hand_pos_array.get_lock():
-                    left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
-                with right_hand_pos_array.get_lock():
-                    right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
-                # Read a single lowstate buffer for q and dq so they correspond
-                # to the same DDS observation in this fork.
-                from teleop.robot_control.robot_arm import G1_29_JointArmIndex
-                lowstate = arm_ctrl.lowstate_buffer.GetData()
-                arm_q = [lowstate.motor_state[j].q for j in G1_29_JointArmIndex]
-                arm_dq = [lowstate.motor_state[j].dq for j in G1_29_JointArmIndex]
-                arm_read_ns = time.monotonic_ns()
-                with hand_lock:
-                    hand_state, hand_action = list(hand_states[:]), list(hand_actions[:])
-                hand_read_ns = time.monotonic_ns()
+                import numpy as np
+                left_hand_pos = np.asarray(tele_data.left_hand_pos).flatten()
+                right_hand_pos = np.asarray(tele_data.right_hand_pos).flatten()
+                have_robot = True
+                if bridge:
+                    # arm/hand/tactile come from the Orin bridge over UDP.
+                    robot_state, _ = link.latest_state()
+                    if robot_state is not None and robot_state.arm_q and robot_state.left_hand_q:
+                        arm_q, arm_dq = robot_state.arm_q, robot_state.arm_dq
+                        hand_state = robot_state.left_hand_q + robot_state.right_hand_q
+                        hand_action = robot_state.left_hand_action + robot_state.right_hand_action
+                    else:
+                        have_robot = False
+                    arm_read_ns = hand_read_ns = time.monotonic_ns()
+                    touch = link.tactile_snapshot()
+                else:
+                    with left_hand_pos_array.get_lock():
+                        left_hand_pos_array[:] = left_hand_pos
+                    with right_hand_pos_array.get_lock():
+                        right_hand_pos_array[:] = right_hand_pos
+                    # Read a single lowstate buffer for q and dq so they correspond
+                    # to the same DDS observation in this fork.
+                    from teleop.robot_control.robot_arm import G1_29_JointArmIndex
+                    lowstate = arm_ctrl.lowstate_buffer.GetData()
+                    arm_q = [lowstate.motor_state[j].q for j in G1_29_JointArmIndex]
+                    arm_dq = [lowstate.motor_state[j].dq for j in G1_29_JointArmIndex]
+                    arm_read_ns = time.monotonic_ns()
+                    with hand_lock:
+                        hand_state, hand_action = list(hand_states[:]), list(hand_actions[:])
+                    hand_read_ns = time.monotonic_ns()
+                    touch = tactile.snapshot()
                 neck_latest = neck_state.latest()
                 neck_read_ns = time.monotonic_ns()
-                touch = tactile.snapshot()
-                sample_ns, wall_ns = time.monotonic_ns(), time.time_ns()
-                # Arrays are required by Pinocchio/CasADi in the legacy IK.
-                import numpy as np
-                sol_q, sol_tauff = arm_ik.solve_ik(
-                    tele_data.left_arm_pose, tele_data.right_arm_pose,
-                    np.asarray(arm_q), np.asarray(arm_dq))
-                arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
-                action_ns = time.monotonic_ns()
-                if record_running:
-                    states, actions = build_states_actions(
-                        arm_q, arm_dq, sol_q, sol_tauff, hand_state, hand_action,
-                        neck_record_entries(*neck_latest))
-                    timing = frame_timing_entry(sample_ns, frame,
-                        clock_sync.estimate() if clock_sync else None, neck_latest[0])
-                    timing.update(host_wall_ns=wall_ns, image_read_host_monotonic_ns=image_read_ns,
-                        image_observed_host_monotonic_ns=image_observed_ns,
-                        arm_read_host_monotonic_ns=arm_read_ns,
-                        hand_read_host_monotonic_ns=hand_read_ns,
-                        neck_read_host_monotonic_ns=neck_read_ns,
-                        action_host_monotonic_ns=action_ns,
-                        xr_head_received_host_monotonic_ns=xr.tvuer.head_received_ns.value,
-                        xr_hand_received_host_monotonic_ns=xr.tvuer.hand_received_ns.value)
-                    states["timing"] = timing
-                    # Without clock sync we can still bound how long a cached
-                    # JPEG has been reused, while capture latency stays null.
-                    freshness = timing["image_age_ms"]
-                    if freshness is None:
-                        freshness = (sample_ns - image_observed_ns) / 1e6
-                    observation_complete = complete_observation(frame, freshness, neck_latest, touch)
-                    diagnostics.emit("record conditions", [(observation_complete,
-                        "sample ACCEPTED" if observation_complete else "sample SKIPPED")] +
-                        observation_status(frame, freshness, neck_latest, touch) + [
-                            (timing["image_age_ms"] is not None,
-                             "image age uses PC2 clock sync" if timing["image_age_ms"] is not None else
-                             "image age uses cached-frame duration; capture latency UNKNOWN")],
-                        repeat=not observation_complete)
-                    if observation_complete:
-                        image_ages.append(timing["image_age_ms"])
-                        recorder.add_item(colors=split_stereo(frame.bgr, shape[1]), depths={},
-                            states=states, actions=actions, tactiles=touch)
-                    if recorder.item_data_queue.qsize() > 2 * args.frequency:
-                        raise RuntimeError("episode disk writer is over two seconds behind")
+                if not have_robot:
+                    if time.monotonic() - last_warning > 2:
+                        logger.warning("Waiting for robot state from the Orin bridge "
+                                       "(arm/hand). Is pc2/robot_bridge.py running and reachable?")
+                        last_warning = time.monotonic()
+                else:
+                    sample_ns, wall_ns = time.monotonic_ns(), time.time_ns()
+                    # Arrays are required by Pinocchio/CasADi in the legacy IK.
+                    sol_q, sol_tauff = arm_ik.solve_ik(
+                        tele_data.left_arm_pose, tele_data.right_arm_pose,
+                        np.asarray(arm_q), np.asarray(arm_dq))
+                    if bridge:
+                        link.send_command(sol_q, sol_tauff, left_hand_pos, right_hand_pos)
+                    else:
+                        arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
+                    action_ns = time.monotonic_ns()
+                    if record_running:
+                        states, actions = build_states_actions(
+                            arm_q, arm_dq, sol_q, sol_tauff, hand_state, hand_action,
+                            neck_record_entries(*neck_latest))
+                        timing = frame_timing_entry(sample_ns, frame,
+                            clock_sync.estimate() if clock_sync else None, neck_latest[0])
+                        timing.update(host_wall_ns=wall_ns, image_read_host_monotonic_ns=image_read_ns,
+                            image_observed_host_monotonic_ns=image_observed_ns,
+                            arm_read_host_monotonic_ns=arm_read_ns,
+                            hand_read_host_monotonic_ns=hand_read_ns,
+                            neck_read_host_monotonic_ns=neck_read_ns,
+                            action_host_monotonic_ns=action_ns,
+                            xr_head_received_host_monotonic_ns=xr.tvuer.head_received_ns.value,
+                            xr_hand_received_host_monotonic_ns=xr.tvuer.hand_received_ns.value)
+                        states["timing"] = timing
+                        # Without clock sync we can still bound how long a cached
+                        # JPEG has been reused, while capture latency stays null.
+                        freshness = timing["image_age_ms"]
+                        if freshness is None:
+                            freshness = (sample_ns - image_observed_ns) / 1e6
+                        observation_complete = complete_observation(frame, freshness, neck_latest, touch)
+                        diagnostics.emit("record conditions", [(observation_complete,
+                            "sample ACCEPTED" if observation_complete else "sample SKIPPED")] +
+                            observation_status(frame, freshness, neck_latest, touch) + [
+                                (timing["image_age_ms"] is not None,
+                                 "image age uses PC2 clock sync" if timing["image_age_ms"] is not None else
+                                 "image age uses cached-frame duration; capture latency UNKNOWN")],
+                            repeat=not observation_complete)
+                        if observation_complete:
+                            image_ages.append(timing["image_age_ms"])
+                            recorder.add_item(colors=split_stereo(frame.bgr, shape[1]), depths={},
+                                states=states, actions=actions, tactiles=touch)
+                        if recorder.item_data_queue.qsize() > 2 * args.frequency:
+                            raise RuntimeError("episode disk writer is over two seconds behind")
             if record_running and not observation_complete:
                 if not tracking:
                     diagnostics.emit("record conditions", [(False,
@@ -865,7 +909,8 @@ def run(args: argparse.Namespace) -> int:
             attempt("move arms home", arm_ctrl.ctrl_dual_arm_go_home)
         if keyboard_thread is not None:
             attempt("stop keyboard", stop_listening)
-        for label, resource in (("tactile", tactile), ("neck state", neck_state),
+        for label, resource in (("robot bridge link", link), ("tactile", tactile),
+                                ("neck state", neck_state),
                                 ("clock sync", clock_sync), ("images", img_client),
                                 ("XR", xr), ("recorder", recorder)):
             if resource is not None:
