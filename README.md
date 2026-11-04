@@ -29,10 +29,11 @@ python3 pc2/zed_teleimager_server.py
 python3 pc2/head_pose_receiver.py --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
 # PC2 터미널 3: 로봇 DDS<->UDP 브리지 (host-ip/interface 기본값 사용)
 python3 pc2/robot_bridge.py
-# Host: 녹화기 (브리지 모드)
-python3 active_camera_host/teleop_record_dex3_tactile.py --xr-repo "$HOME/hckang/xr_teleoperate" \
-  --bridge-ip 192.168.50.9 --headless
+# Host: 녹화기 (브리지 모드가 기본; --bridge-ip 기본 192.168.50.9)
+python3 active_camera_host/teleop_record_dex3_tactile.py --xr-repo "$HOME/hckang/xr_teleoperate" --headless
 ```
+
+> Host를 로봇 유선망에 직접 꽂아 DDS를 쓰려면 `--no-bridge`를 준다.
 
 그다음 Quest 브라우저에서 접속하고 **Enter VR**:
 

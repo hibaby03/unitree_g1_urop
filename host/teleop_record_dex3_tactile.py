@@ -100,9 +100,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="do not probe the PC2 clock; timing ages are recorded as null")
     parser.add_argument("--network-interface", default=None,
                         help="DDS network interface, e.g. eth0 (direct mode only)")
-    parser.add_argument("--bridge-ip", default=None,
-                        help="Orin robot_bridge address; use the UDP bridge for arm/hand/tactile "
-                             "instead of direct DDS (for a Host that cannot reach the robot DDS net)")
+    parser.add_argument("--bridge-ip", default="192.168.50.9",
+                        help="Orin robot_bridge address; the UDP bridge carries arm/hand/tactile "
+                             "(default, for a Host that cannot reach the robot DDS net)")
+    parser.add_argument("--no-bridge", action="store_true",
+                        help="use direct DDS instead of the Orin bridge (Host must be on the robot DDS net)")
     parser.add_argument("--bridge-state-port", type=int, default=5008,
                         help="UDP port the bridge sends robot state/tactile to")
     parser.add_argument("--bridge-command-port", type=int, default=5009,
@@ -117,6 +119,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--task-desc", default="task description")
     parser.add_argument("--task-steps", default="step1: do this; step2: do that;")
     args = parser.parse_args(argv)
+    if args.no_bridge:
+        args.bridge_ip = None
     for name in ("neck_pose_port", "neck_state_port", "clock_sync_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be in 1..65535")
