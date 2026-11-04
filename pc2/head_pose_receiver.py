@@ -113,11 +113,19 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="do not send neck state back to the Host",
     )
     motor = parser.add_argument_group("2XL430 motor output")
+    # Python 3.8 on PC2 lacks argparse.BooleanOptionalAction; use paired flags.
     motor.add_argument(
         "--enable-motor",
-        action=argparse.BooleanOptionalAction,
+        dest="enable_motor",
+        action="store_true",
         default=True,
-        help="enable torque and write goals (default); --no-enable-motor for monitor-only",
+        help="enable torque and write goals (default)",
+    )
+    motor.add_argument(
+        "--no-enable-motor",
+        dest="enable_motor",
+        action="store_false",
+        help="monitor-only: do not enable torque or write goals",
     )
     motor.add_argument("--dxl-device", default="/dev/ttyUSB0")
     motor.add_argument("--dxl-baudrate", type=int, default=57600)
