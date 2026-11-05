@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import socket
 import sys
 import time
@@ -66,6 +67,39 @@ def direction_sign(value: str) -> int:
     if parsed not in (-1, 1):
         raise argparse.ArgumentTypeError("must be -1 or 1")
     return parsed
+
+
+class RecoveryRamp:
+    """Keep the last command on loss; slew back to tracking after recovery."""
+
+    def __init__(self, speed_deg_s: float) -> None:
+        if not math.isfinite(speed_deg_s) or speed_deg_s <= 0:
+            raise ValueError("resume speed must be finite and positive")
+        self.speed_deg_s = speed_deg_s
+        self.last_command = None
+        self.recovering = False
+        self._last_update = None
+
+    def hold(self) -> None:
+        self.recovering = self.last_command is not None
+        self._last_update = None
+
+    def apply(self, yaw_deg: float, pitch_deg: float, now: float):
+        target = (yaw_deg, pitch_deg)
+        if self.recovering:
+            # The first recovered pose repeats the held goal. Never turn a
+            # long packet gap into a large command step (at most 100 ms/step).
+            elapsed = (0.0 if self._last_update is None else
+                       min(0.1, max(0.0, now - self._last_update)))
+            step = self.speed_deg_s * elapsed
+            command = tuple(previous + max(-step, min(step, goal - previous))
+                            for previous, goal in zip(self.last_command, target))
+            self._last_update = now
+            self.recovering = command != target
+        else:
+            command = target
+        self.last_command = command
+        return command
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -141,9 +175,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--motor-timeout-ms",
         type=positive_float,
         default=1000.0,
-        help="torque off and exit after this long without a valid tracked pose",
+        help="hold the last goal with torque on after this long without a valid tracked pose",
     )
-    return parser.parse_args(argv)
+    motor.add_argument(
+        "--resume-speed-deg-s",
+        type=positive_float,
+        default=30.0,
+        help="maximum yaw/pitch command speed while catching up after a timeout [deg/s]",
+    )
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.resume_speed_deg_s):
+        parser.error("--resume-speed-deg-s must be finite")
+    return args
 
 
 def run(args: argparse.Namespace) -> int:
@@ -201,6 +244,8 @@ def run(args: argparse.Namespace) -> int:
     last_valid_monotonic: Optional[float] = None
     last_print_monotonic = 0.0
     stale_reported = False
+    holding = False
+    recovery = RecoveryRamp(args.resume_speed_deg_s)
     print_period = 1.0 / args.print_rate
     timeout_seconds = args.timeout_ms / 1000.0
 
@@ -229,24 +274,25 @@ def run(args: argparse.Namespace) -> int:
                 )
                 stale_reported = True
 
-            # Only guard an established stream: wait indefinitely for the first
-            # pose (torque stays on, holding position), then torque off and exit
-            # if the stream stops for motor_timeout_ms.
-            if neck is not None and last_valid_monotonic is not None:
+            # Only guard an established stream. On loss leave the last motor
+            # goal and torque untouched, and keep receiving for recovery.
+            if neck is not None and last_valid_monotonic is not None and not holding:
                 if now - last_valid_monotonic >= args.motor_timeout_ms / 1000.0:
+                    holding = True
+                    recovery.hold()
                     print(
                         json.dumps(
                             {
                                 "event": "motor_timeout",
                                 "timeout_ms": args.motor_timeout_ms,
-                                "action": "torque_off_and_exit",
+                                "action": "hold_last_goal",
+                                "command_deg": recovery.last_command,
                             },
                             separators=(",", ":"),
                         ),
                         file=sys.stderr,
                         flush=True,
                     )
-                    return 3
 
             try:
                 datagram, source = receive_socket.recvfrom(256)
@@ -302,14 +348,23 @@ def run(args: argparse.Namespace) -> int:
 
                 motor_positions = None
                 motor_command_pc2_time_ns = None
+                command_deg = (target.yaw_deg, target.pitch_deg)
                 if neck is not None:
+                    if holding:
+                        holding = False
+                        print(json.dumps({"event": "tracking_resumed",
+                                          "action": "ramp_to_target",
+                                          "resume_speed_deg_s": args.resume_speed_deg_s},
+                                         separators=(",", ":")), flush=True)
+                    command_deg = recovery.apply(*command_deg, now_monotonic)
+                    if record is not None:
+                        record.update(command_deg=command_deg, recovering=recovery.recovering)
                     motor_command_pc2_time_ns = time.monotonic_ns()
                     if record is not None:
                         record["write_start_pc2_ns"] = time.monotonic_ns()
                     try:
                         motor_positions = neck.write_angles(
-                            target.yaw_deg,
-                            target.pitch_deg,
+                            *command_deg,
                         )
                     finally:
                         if record is not None:
@@ -342,7 +397,7 @@ def run(args: argparse.Namespace) -> int:
                                 command_pc2_monotonic_ns=(
                                     motor_command_pc2_time_ns or sample_pc2_time_ns
                                 ),
-                                command_deg=(target.yaw_deg, target.pitch_deg),
+                                command_deg=command_deg,
                                 goal_position=motor_positions,
                                 present_pc2_monotonic_ns=present_time_ns,
                                 present_deg=present_deg,
@@ -373,8 +428,8 @@ def run(args: argparse.Namespace) -> int:
                 clock_delta_ms = (time.time_ns() - target.sender_time_ns) / 1_000_000.0
                 output = {
                     "sequence": target.sequence,
-                    "yaw_deg": round(target.yaw_deg, 4),
-                    "pitch_deg": round(target.pitch_deg, 4),
+                    "yaw_deg": round(command_deg[0], 4),
+                    "pitch_deg": round(command_deg[1], 4),
                     "tracked": True,
                     "source": source[0],
                     "pc2_monotonic_ns": sample_pc2_time_ns,

@@ -89,6 +89,18 @@ pitch is up positive, `angle = (count - center) × sign × 360 / 4096`. Invalid
 fields are sent as zero. Both timestamps are in the PC2 monotonic domain and
 must not be compared with Host clocks.
 
+After an established pose stream stops for `--motor-timeout-ms` (default 1000),
+the receiver logs `motor_timeout` with `action: hold_last_goal`, leaves the
+last goal and torque unchanged, and continues listening. On the next accepted
+tracked pose it logs `tracking_resumed`. The first recovered command repeats
+the held goal; subsequent commands catch up at `--resume-speed-deg-s` (default
+30 degrees/second per axis), with at most 100 ms of motion budget per packet.
+Once caught up, normal tracking resumes. Feedback `command_deg` and the
+receiver's printed yaw/pitch report the actual ramped command, not the raw
+pose target; the optional trace retains `target_deg` and adds `command_deg`.
+There is no feedback heartbeat during a pose outage. Ctrl+C and errors still
+close the driver and disable torque. Motor hardware protection is unchanged.
+
 # ZED frame stamp v1 (PC2 → Host, inside ZMQ JPEG)
 
 `pc2/zed_teleimager_server.py` inserts one JPEG comment segment directly after
