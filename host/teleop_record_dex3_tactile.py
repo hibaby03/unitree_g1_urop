@@ -76,7 +76,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--xr-repo", default="~/hckang/xr_teleoperate",
                         help="xr_teleoperate repository root")
-    parser.add_argument("--neck-pose-ip", default="192.168.50.9")
+    parser.add_argument("--neck-pose-ip", default="192.168.123.164")
     parser.add_argument("--neck-pose-port", type=int, default=5005)
     parser.add_argument("--neck-pose-rate", type=positive_rate, default=60.0)
     parser.add_argument("--neck-state-bind", default="0.0.0.0",
@@ -95,14 +95,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--probe-seconds", type=positive_rate, default=5.0)
     parser.add_argument("--smoke-test", action="store_true", help="write and validate a synthetic episode without hardware")
     parser.add_argument("--validate-episode", help="validate an existing episode directory or data.json")
-    parser.add_argument("--img-server-ip", default="192.168.50.9")
+    parser.add_argument("--img-server-ip", default="192.168.123.164")
     parser.add_argument("--clock-sync-port", type=int, default=DEFAULT_SYNC_PORT,
                         help="PC2 clock-sync UDP port (zed_teleimager_server.py)")
     parser.add_argument("--no-clock-sync", action="store_true",
                         help="do not probe the PC2 clock; timing ages are recorded as null")
     parser.add_argument("--network-interface", default=None,
                         help="DDS network interface, e.g. eth0 (direct mode only)")
-    parser.add_argument("--bridge-ip", default="192.168.50.9",
+    parser.add_argument("--bridge-ip", default="192.168.123.164",
                         help="Orin robot_bridge address; the UDP bridge carries arm/hand/tactile "
                              "(default, for a Host that cannot reach the robot DDS net)")
     parser.add_argument("--no-bridge", action="store_true",

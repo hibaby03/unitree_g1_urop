@@ -32,9 +32,9 @@ CAMERA_MOVE_FLAT = [1, 0, 0, 0,
 class ArgsTests(unittest.TestCase):
     def test_defaults(self):
         args = viewer.parse_args([])
-        self.assertEqual(args.img_server_ip, "192.168.50.9")
+        self.assertEqual(args.img_server_ip, "192.168.123.164")
         self.assertEqual(args.zmq_port, 55555)
-        self.assertEqual(args.neck_pose_ip, "192.168.50.9")
+        self.assertEqual(args.neck_pose_ip, "192.168.123.164")
 
     def test_no_neck_disables_forwarding(self):
         self.assertIsNone(viewer.parse_args(["--no-neck"]).neck_pose_ip)

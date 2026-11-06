@@ -137,7 +137,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Orin DDS<->UDP bridge (unitree_sdk2py only).")
     parser.add_argument("--interface", default="eth0", help="DDS network interface (e.g. eth0)")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain id")
-    parser.add_argument("--host-ip", default="192.168.50.7", help="Host address to send robot state to")
+    parser.add_argument("--host-ip", default="192.168.123.7", help="Host address to send robot state to")
     parser.add_argument("--state-port", type=int, default=DEFAULT_STATE_PORT)
     parser.add_argument("--command-port", type=int, default=DEFAULT_COMMAND_PORT)
     parser.add_argument("--state-rate", type=float, default=90.0, help="robot-state send rate [Hz]")
