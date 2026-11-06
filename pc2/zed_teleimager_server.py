@@ -8,6 +8,10 @@ ZMQ config service, JPEG publisher, and WebRTC publisher unchanged.
 Each ZMQ JPEG carries the frame's PC2 capture time in a comment segment, and a
 UDP clock-sync responder lets the Host convert it to its own clock (see
 PROTOCOL.md). Both are invisible to teleimager clients that ignore them.
+
+A second ZMQ stream (--display-port) carries per-eye, downscaled JPEGs for the
+Quest display, built from the same ZED capture; the recording stream is not
+affected by its scale, quality or rate (pc2/display_stream.py).
 """
 
 from __future__ import annotations
@@ -23,9 +27,13 @@ import cv2
 import yaml
 
 try:
+    from .display_stream import (DEFAULT_DISPLAY_PORT, DisplayStatsReporter,
+                                 DisplayStreamPublisher)
     from .frame_timing import DEFAULT_SYNC_PORT, ClockSyncServer, stamp_jpeg
     from .zed_stereo import ZedCaptureOptions, ZedStereoCapture
 except ImportError:
+    from display_stream import (  # type: ignore[no-redef]
+        DEFAULT_DISPLAY_PORT, DisplayStatsReporter, DisplayStreamPublisher)
     from frame_timing import (  # type: ignore[no-redef]
         DEFAULT_SYNC_PORT, ClockSyncServer, stamp_jpeg)
     from zed_stereo import ZedCaptureOptions, ZedStereoCapture  # type: ignore[no-redef]
@@ -45,9 +53,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="UDP port answering Host clock-sync probes")
     parser.add_argument("--no-clock-sync", action="store_true",
                         help="do not run the clock-sync responder")
+    display = parser.add_argument_group(
+        "Quest display stream (second ZMQ stream; recording stream is unchanged)")
+    display.add_argument("--display-port", type=int, default=DEFAULT_DISPLAY_PORT,
+                         help="ZMQ port of the per-eye display stream (must differ from the "
+                              "recording zmq_port in the camera config)")
+    display.add_argument("--display-scale", type=float, default=0.5,
+                         help="eye image scale for the display stream, 0.1..1.0")
+    display.add_argument("--display-jpeg-quality", type=int, default=70,
+                         help="JPEG quality of the display stream, 1..100")
+    display.add_argument("--display-fps", type=float, default=30.0,
+                         help="maximum display stream rate; encoding runs at this rate")
+    display.add_argument("--no-display-stream", action="store_true",
+                         help="do not publish the display stream (Host needs --legacy-display)")
     args = parser.parse_args(argv)
     if not 1 <= args.clock_sync_port <= 65535:
         parser.error("--clock-sync-port must be in 1..65535")
+    if not 1 <= args.display_port <= 65535:
+        parser.error("--display-port must be in 1..65535")
+    if not 0.1 <= args.display_scale <= 1.0:
+        parser.error("--display-scale must be in 0.1..1.0")
+    if not 1 <= args.display_jpeg_quality <= 100:
+        parser.error("--display-jpeg-quality must be in 1..100")
+    if not args.display_fps > 0:
+        parser.error("--display-fps must be positive")
     return args
 
 
@@ -104,7 +133,8 @@ def load_and_validate_config(path: Path) -> tuple[dict[str, Any], ZedCaptureOpti
     return config, options
 
 
-def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions):
+def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions,
+                          display: Optional[dict] = None):
     class ZedMiniCamera(image_server_module.BaseCamera):
         def __init__(
             self,
@@ -131,6 +161,10 @@ def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions):
             self._capture = ZedStereoCapture(options)
             self._capture.open()
             self._frame_sequence = 0
+            self._display = self._display_stats = None
+            if display is not None:
+                self._display = DisplayStreamPublisher(**display)
+                self._display_stats = DisplayStatsReporter(self._display)
 
         def __str__(self) -> str:
             return (
@@ -140,13 +174,20 @@ def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions):
 
         def _update_frame(self) -> None:
             bgr = self._capture.grab()
+            self._frame_sequence += 1
+            if self._display is not None:
+                # Same capture as the recording stream; encoding happens in the
+                # display thread, so this loop only hands the frame over.
+                self._display.submit(
+                    bgr, self._frame_sequence,
+                    self._capture.latest_pc2_monotonic_ns,
+                    self._capture.latest_zed_image_time_ns)
             if self._enable_webrtc:
                 self._webrtc_buffer.write(bgr)
             if self._enable_zmq:
                 ok, encoded = cv2.imencode(".jpg", bgr)
                 if not ok:
                     raise RuntimeError("could not JPEG-encode the ZED stereo frame")
-                self._frame_sequence += 1
                 self._zmq_buffer.write(stamp_jpeg(
                     encoded.tobytes(),
                     self._frame_sequence,
@@ -156,6 +197,10 @@ def make_zed_camera_class(image_server_module: Any, options: ZedCaptureOptions):
             self._ready.set()
 
         def release(self) -> None:
+            if self._display_stats is not None:
+                self._display_stats.close()
+            if self._display is not None:
+                self._display.close()
             self._capture.close()
 
     return ZedMiniCamera
@@ -190,7 +235,18 @@ def run(args: argparse.Namespace) -> int:
             "the same xr_teleoperate checkout used by the Host."
         ) from error
 
-    image_server.OpenCVCamera = make_zed_camera_class(image_server, options)
+    display = None
+    if not args.no_display_stream:
+        recording_port = config["head_camera"].get("zmq_port")
+        if recording_port == args.display_port:
+            raise ValueError(
+                f"--display-port {args.display_port} collides with the recording zmq_port")
+        display = dict(port=args.display_port, scale=args.display_scale,
+                       jpeg_quality=args.display_jpeg_quality, fps=args.display_fps)
+        print(f"[display] publishing per-eye display JPEGs on tcp://*:{args.display_port} "
+              f"(scale {args.display_scale}, quality {args.display_jpeg_quality}, "
+              f"max {args.display_fps:g} fps)", flush=True)
+    image_server.OpenCVCamera = make_zed_camera_class(image_server, options, display)
     image_server.CameraFinder = _ZedOnlyCameraFinder
     # Image capture and the neck process both use PC2 CLOCK_MONOTONIC, so one
     # responder here serves image and neck timestamps alike.

@@ -13,9 +13,11 @@ import sys
 import time
 
 try:
+    from .display_feed import DisplayFeedReceiver, relay_to_vuer
     from .head_pose_udp import _validated_pose_matrix
     from .recorder_diagnostics import PoseEventDiagnostics
 except ImportError:
+    from display_feed import DisplayFeedReceiver, relay_to_vuer
     from head_pose_udp import _validated_pose_matrix
     from recorder_diagnostics import PoseEventDiagnostics
 
@@ -72,9 +74,19 @@ def stop_process(process) -> None:
 
 
 class LegacyStereoXR:
-    """Display teleimager BGR frames through the old wrapper's shared memory."""
+    """Quest display for the old shared-memory TeleVuer wrapper.
 
-    def __init__(self, wrapper, shape, cert, key, screen_y=-0.1, fps=30.0):
+    Default (``display_feed=None``): teleimager BGR frames go through shared
+    memory and the Vuer child converts, splits and re-encodes them.
+
+    With ``display_feed=(ip, port)``: the Vuer child instead receives PC2's
+    per-eye display JPEGs itself (host/display_feed.py) and forwards the bytes
+    unchanged, so ``render()`` does no pixel work. The receiver is created inside
+    the child (after the fork) and runs apart from the IK/control/recording loop.
+    """
+
+    def __init__(self, wrapper, shape, cert, key, screen_y=-0.1, fps=30.0,
+                 display_feed=None):
         import numpy as np
         from multiprocessing import shared_memory
         from vuer.schemas import Hands, ImageBackground
@@ -145,6 +157,14 @@ class LegacyStereoXR:
                 import cv2
                 session.upsert(Hands(stream=True, key="hands", hideLeft=True,
                                      hideRight=True), to="bgChildren")
+                if display_feed is not None:
+                    feed = DisplayFeedReceiver(*display_feed)
+                    try:
+                        await relay_to_vuer(session, feed, ImageBackground,
+                                            screen_y=screen_y, tag="display")
+                    finally:
+                        feed.close()
+                    return
                 while True:
                     rgb = cv2.cvtColor(self.img_array, cv2.COLOR_BGR2RGB)
                     eyes = (rgb[:, :self.img_width], rgb[:, self.img_width:])
@@ -163,6 +183,7 @@ class LegacyStereoXR:
                         return
                     await asyncio.sleep(1.0 / fps)
 
+        self.relays_display_jpeg = display_feed is not None
         self.wrapper = None
         self.shm = shared_memory.SharedMemory(create=True, size=int(np.prod(shape)))
         self.image = np.ndarray(shape, dtype=np.uint8, buffer=self.shm.buf)
@@ -187,6 +208,8 @@ class LegacyStereoXR:
         return self.wrapper.tvuer
 
     def render(self, bgr) -> None:
+        if self.relays_display_jpeg:
+            return  # the Vuer child shows PC2's display stream, not this frame
         import numpy as np
         if bgr.shape != self.image.shape:
             raise ValueError(f"ZED frame {bgr.shape} != configured {self.image.shape}")

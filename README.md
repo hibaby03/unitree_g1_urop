@@ -13,7 +13,7 @@ PC2의 `robot_bridge.py`가 UDP로 중계한다. 아래 기본값에 이미 반�
 
 ### 영상 + 목만 보기
 ```bash
-# PC2 터미널 1: ZED 영상 서버
+# PC2 터미널 1: ZED 영상 서버 (녹화용 55555 + Quest 표시용 55556 두 스트림)
 python3 pc2/zed_teleimager_server.py
 # PC2 터미널 2: 목 모터 (enable-motor 기본 on; 처음엔 15도 제한)
 python3 pc2/head_pose_receiver.py --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
@@ -92,8 +92,10 @@ ZED Mini ─ USB 3 ─> PC2 PyZED ─> rectified left|right frame
 - `host/run_teleop_with_neck.py`: 기존 teleop 실행과 동시에 raw OpenXR head pose 송신
 - `host/teleop_record_dex3_tactile.py`: G1_29 + Dex3-1 teleop 루프. head pose 송신과
   함께 팔·손·Dex3-1 tactile·목 yaw/pitch를 episode에 녹화
-- `host/zmq_stereo_vr.py`: Host가 ZMQ로 받은 ZED 영상을 Vuer로 Quest 양안에 표시하는
-  독립 뷰어. 선택적으로 목 추종(3-2절)
+- `pc2/display_stream.py`: Quest 표시용 두 번째 ZMQ 스트림(눈별 축소·JPEG 압축, 55556)
+- `host/display_feed.py`: 표시용 스트림을 받아 JPEG 바이트 그대로 Vuer에 전달
+- `host/zmq_stereo_vr.py`: Host가 PC2 표시용 JPEG(기본) 또는 녹화 스트림(`--legacy-display`)을
+  Vuer로 Quest 양안에 표시하는 독립 뷰어. 선택적으로 목 추종(3-2절)
 - `host/head_pose_udp.py`: OpenXR matrix 검증, quaternion 변환, UDP packet 생성
 - `host/neck_state_receiver.py`: PC2가 보낸 목 명령/엔코더 packet 수신과 녹화용 변환
 - `host/keyboard_2xl430.py`: Windows에서 2XL430 두 축을 키보드로 움직이는 확인용 도구
@@ -280,12 +282,14 @@ Ctrl+C 또는 제어 오류로 종료할 때의 토크 해제와 모터 자체�
 
 ## 3-2. Host가 받은 영상을 Quest로 보기 (`zmq_stereo_vr.py`)
 
-3-1절은 Quest가 PC2의 WebRTC를 직접 재생한다. 이 뷰어는 녹화 경로와 같은
-PC2 ZMQ JPEG(55555)를 Host가 받아 decode한 뒤 Vuer `ImageBackground`의 왼쪽/오른쪽
-눈 레이어(`layers=1/2`)로 보낸다. 따라서 Quest에서 보는 영상이 녹화되는 영상과
-같다. xr_teleoperate의 TeleVuer, DDS, IK, 녹화기는 띄우지 않으므로 G1 없이 돌릴 수
-있고, legacy TeleVuer 버전이나 Linux `fork` 제약도 받지 않는다. 필요한 패키지는
-`vuer[all]`, `pyzmq`, `opencv-python`, `numpy`이며 xr_teleoperate의 `tv` 환경에 이미 있다.
+3-1절은 Quest가 PC2의 WebRTC를 직접 재생한다. 이 뷰어는 Host가 영상을 받아 Vuer
+(WebSocket 8012)로 Quest에 중계한다. xr_teleoperate의 TeleVuer, DDS, IK, 녹화기는
+띄우지 않으므로 G1 없이 돌릴 수 있고, legacy TeleVuer 버전이나 Linux `fork` 제약도
+받지 않는다. 필요한 패키지는 `vuer[all]`, `pyzmq`, `numpy`이며(`--legacy-display`만
+`opencv-python`도 필요) xr_teleoperate의 `tv` 환경에 이미 있다.
+
+**표시 경로(기본, JPEG 중계)**: Quest 표시용 영상은 PC2가 만든다. 자세한 구조,
+옵션, 비교 방법은 바로 아래 "3-2a. Quest 표시 영상: PC2 JPEG 중계"를 본다.
 
 ```bash
 # PC2
@@ -303,16 +307,97 @@ python active_camera_host/zmq_stereo_vr.py --no-neck
 
 Quest 브라우저에서 기존과 같은 `https://192.168.123.7:8012/?ws=wss://192.168.123.7:8012`로
 접속한다. 인증서는 `--cert/--key`, `XR_TELEOP_CERT/KEY`, `~/.config/xr_teleoperate/` 순으로
-찾는다. 2초마다 수신/송신 fps와 영상 지연(PC2 캡처 → Host 시점, clock sync 필요)이
-출력된다. Quest 화면까지의 지연은 여기에 Vuer JPEG 재인코딩과 Wi-Fi 전송이 더해진다.
+찾는다. 2초마다 Host 수신 fps, **Vuer로 전달한 fps**, 메시지 크기·전송량, 영상 지연(PC2
+캡처 → Host 시점, clock sync 필요)이 출력된다. "Vuer 전달 fps"는 Host가 Vuer에 넘긴
+횟수이며 Quest가 실제로 표시한 fps가 아니다. Quest 화면까지의 지연에는 여기에 Wi-Fi
+전송과 Quest의 JPEG 복원이 더해진다.
 
 - Vuer 서버가 8012를 쓰므로 teleop/녹화 스크립트와 동시에 실행하지 않는다.
 - `--neck-pose-ip`를 주면 `CAMERA_MOVE`를 head-pose packet으로 PC2에 보낸다.
   250 ms 이상 새 pose가 없으면 송신을 멈추므로 Quest가 끊기면 PC2 watchdog이
   마지막 목표를 토크를 켠 채 유지한다(3-1절과 같은 복구 규칙). 데스크톱 브라우저로 같은 주소에 접속해 시점을
   돌리면 그 카메라 이동도 head pose로 들어가므로, 목 추종 중에는 Quest만 접속한다.
-- 화면 크기/거리는 `--distance`(기본 1 m), 화질은 `--jpeg-quality`(기본 80),
-  표시 주기는 `--display-fps`(기본 30)로 조정한다. 같은 frame은 다시 보내지 않는다.
+- 화면 거리는 `--distance`(기본 1 m), 높이는 `--screen-y`로 조정한다. 표시 해상도·화질·
+  주기는 PC2 서버 옵션이다(3-2a절). 같은 frame은 다시 보내지 않는다.
+- `--jpeg-quality`, `--display-fps`는 `--legacy-display`에서만 쓰인다.
+
+## 3-2a. Quest 표시 영상: PC2 JPEG 중계
+
+**목적**: Host의 영상 처리 부하를 줄인다. 현재 겪는 영상 약 1 Hz와 목 끊김이 이 변경만으로
+해결된다고 단정하지 않는다. 변경 전후를 같은 조건에서 비교해 확인한다.
+
+```text
+이전: ZED → PC2 JPEG(2560x720) → ZMQ 55555 → Host JPEG 복원
+        → Vuer 색상 변환·축소·좌우 분리·JPEG 재압축 → Quest
+지금: ZED → PC2에서 표시용 축소·좌우 분리·눈별 JPEG 압축
+        → ZMQ 55556 → Host가 JPEG 바이트 그대로 Vuer에 전달
+        → WebSocket → Quest에서 복원·양안 표시
+```
+
+- PC2는 같은 ZED 캡처 한 번을 녹화용(55555, 원본 해상도, 기존 형식)과 표시용(55556)에
+  함께 쓴다. 표시용 압축은 별도 스레드에서 `--display-fps` 주기로만 하므로 캡처 루프를
+  막지 않고, 늦은 프레임은 쌓지 않고 버린다. 녹화 스트림은 표시용 옵션의 영향을 받지 않는다.
+- 좌우 눈 JPEG와 프레임 번호는 ZMQ 메시지 하나에 같이 들어간다(`PROTOCOL.md`
+  "Display stream v1"). 다른 프레임이 짝지어질 수 없다.
+- Host(`host/display_feed.py`)는 수신 스레드가 최신 메시지만 보관하고, 비동기 작업이 새
+  프레임을 한 번만 `ImageBackground(src=<JPEG bytes>, layers=1/2)`로 Vuer에 넘긴다.
+  디코드·BGR/RGB 변환·리사이즈·재압축이 없고, IK·제어·녹화 루프와 분리돼 있다.
+  새 프레임이 없으면 아무것도 보내지 않는다. Vuer 0.0.60에서 `src`에 bytes를 주면
+  이미지 변환 없이 바이너리로 직렬화되는 것을 소스와 직렬화 왕복으로 확인했다.
+- 녹화기(`teleop_record_dex3_tactile.py`)는 녹화용 디코드는 그대로 하고, Quest 표시만
+  이 중계로 바꿨다(Vuer 자식 프로세스가 직접 55556을 받는다). 기록 조건, 촉각, 관절
+  상태, 목 제어 로직은 건드리지 않았다.
+
+PC2 옵션(`zed_teleimager_server.py`): `--display-port 55556`, `--display-scale 0.5`
+(눈별 축소 비율, 0.5면 눈당 640x360), `--display-jpeg-quality 70`, `--display-fps 30`,
+`--no-display-stream`. Host 옵션: `--display-port 55556`, `--legacy-display`.
+
+**실행** (기본값 사용; PC2 서버를 반드시 새로 시작한다):
+
+```bash
+# PC2 터미널 1
+python3 pc2/zed_teleimager_server.py
+# PC2 터미널 2 (목을 쓸 때)
+python3 pc2/head_pose_receiver.py --yaw-limit-deg 15 --pitch-down-limit-deg 15 --pitch-up-limit-deg 15
+# Host
+python3 host/zmq_stereo_vr.py                 # 영상 + 목
+python3 host/zmq_stereo_vr.py --no-neck       # 영상만
+```
+
+**로그로 확인** (2초마다):
+
+```text
+[display]        PC2 captured 59.8 fps, display sent 30.0 fps, dropped 30, errors 0, 21.4 KB/msg (both eyes), 5.14 Mbit/s, encode 6.2 ms/msg
+[zmq_stereo_vr]  Host received 29.9 fps from PC2, forwarded to Vuer 29.9 fps (handed to Vuer, not the Quest's displayed fps), 21.4 KB/msg, 5.12 Mbit/s, image age at Host 38 ms
+```
+
+(위 숫자는 형식 예시이며 실측이 아니다.) PC2의 captured/sent와 Host의 received/forwarded를
+비교하면 병목 구간을 가를 수 있다. Host `received`가 PC2 `sent`보다 낮으면 PC2→Host
+네트워크, 같으면 PC2 쪽은 정상이다. `[display] no display frames from PC2 yet`가 나오면 PC2
+서버를 이 버전으로 다시 시작하지 않은 것이다.
+
+**기존 방식과 비교**:
+
+```bash
+# A. 이전 방식 (Host가 55555를 디코드하고 Vuer가 재인코딩)
+python3 host/zmq_stereo_vr.py --no-neck --legacy-display
+# B. 새 방식 (같은 PC2 서버에서 --legacy-display만 뺀다)
+python3 host/zmq_stereo_vr.py --no-neck
+```
+
+같은 네트워크·같은 장면에서 A, B를 각각 1~2분 돌리고 Host `top`의 `zmq_stereo_vr` CPU,
+로그의 received/forwarded fps와 Mbit/s, Quest에서 보이는 끊김을 비교한다. 목 지연은
+`NECK_TRACE_DIR`(NECK_LATENCY_KO.md)로 A/B 각각 측정한다. 표시 부하를 더 줄이려면 PC2에서
+`--display-scale 0.35 --display-fps 20`처럼 낮춘다.
+
+전체 녹화기도 같다. 기본이 중계이고, 비교용으로 `--legacy-display`를 주면 이전 방식이다.
+`--display-port`는 PC2와 맞춘다.
+
+**검증 범위**: 좌우 프레임 일치, 최신 프레임만 처리, 같은 프레임 재전송 없음, JPEG 바이트
+무변경 전달, 잘못된 메시지·인코딩 오류 처리는 단위 테스트로 확인했다(`tests/test_display_stream.py`,
+`tests/test_display_feed.py`). **하드웨어(ZED, PC2, Quest)에서는 아직 확인하지 못했다.**
+Quest 브라우저가 bytes `src`를 실제로 표시하는지, 실제 fps·전송량·지연, 영상 1 Hz와 목
+끊김이 개선되는지는 실측이 필요하다.
 
 ## 4. Host teleoperation과 episode 기록
 
@@ -622,6 +707,7 @@ teleimager의 BGR decoder는 별도 스레드라 `.bgr`가 `.jpg`보다 한 fram
 - `60000/TCP`: teleimager camera-config service
 - `60001/TCP/UDP`: ZED head-camera WebRTC signaling/media
 - `55555/TCP`: 녹화용 stereo JPEG ZMQ stream
+- `55556/TCP`: Quest 표시용 눈별 JPEG ZMQ stream (`--display-port`, PROTOCOL.md)
 - `5005/UDP`: Host에서 PC2로 보내는 head pose
 - `5006/UDP`: PC2에서 Host로 돌려보내는 목 명령/엔코더 yaw·pitch
 - `5007/UDP`: Host→PC2 clock-sync probe와 응답 (`zed_teleimager_server.py`)

@@ -175,3 +175,28 @@ class EventInstrumentationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(importlib.util.find_spec("numpy"), "requires numpy")
+class DisplayFeedModeTests(unittest.TestCase):
+    """display_feed=(ip, port): the Vuer child relays PC2's JPEGs; render() does no pixel work."""
+
+    def make(self, **kwargs):
+        schemas = types.ModuleType("vuer.schemas")
+        schemas.Hands = schemas.ImageBackground = object
+        with patch.dict("sys.modules", {"vuer.schemas": schemas}), \
+                patch("host.xr_legacy.mp.get_start_method", return_value="fork"):
+            xr = LegacyStereoXR(FakeWrapper, (2, 4, 3), "unused", "unused", **kwargs)
+        self.addCleanup(xr.close)
+        return xr
+
+    def test_render_copies_frames_only_in_legacy_mode(self):
+        import numpy as np
+        frame = np.full((2, 4, 3), 9, np.uint8)
+        legacy = self.make()
+        legacy.render(frame)
+        self.assertTrue((legacy.image == 9).all())
+        relay = self.make(display_feed=("192.0.2.1", 55556))
+        self.assertTrue(relay.relays_display_jpeg)
+        relay.render(frame)
+        self.assertTrue((relay.image == 0).all())   # nothing copied for display

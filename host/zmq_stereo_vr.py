@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Show the ZED stereo frames the Host receives over ZMQ in the Quest.
+"""Show the ZED stereo stream in the Quest through the Host (Vuer/WebSocket).
 
 Unlike --video-only / --input-mode=none of run_teleop_with_neck.py, where the
-Quest plays PC2's WebRTC stream directly, this viewer displays exactly the
-frames the Host recorder receives: PC2 teleimager ZMQ JPEG (55555) -> Host
-decode -> Vuer ImageBackground on the left/right eye layers. Nothing else of
-xr_teleoperate (TeleVuer, DDS, IK, recorder) is started, so no robot is needed.
+Quest plays PC2's WebRTC stream directly, the Host relays the video. Nothing else
+of xr_teleoperate (TeleVuer, DDS, IK, recorder) is started, so no robot is needed.
+
+Default (JPEG relay): PC2 scales, splits and JPEG-encodes each eye (display
+stream, ZMQ 55556); the Host forwards those JPEG bytes unchanged to Vuer
+ImageBackground(src=bytes) on the left/right eye layers. The Host does no JPEG
+decode, colour conversion, resize or re-encode for display.
+
+--legacy-display: the earlier path, PC2 recording ZMQ JPEG (55555) -> Host decode
+-> Vuer re-encode, kept to compare against the relay.
 
 Optionally (--neck-pose-ip) the Quest head pose is forwarded to PC2's
 head_pose_receiver exactly as in --input-mode=none, so the active camera
@@ -27,10 +33,14 @@ import time
 from typing import Any, Callable, Optional, Sequence
 
 try:
+    from .display_feed import (DEFAULT_DISPLAY_PORT, DisplayFeedReceiver,
+                               relay_to_vuer)
     from .frame_timing import (DEFAULT_SYNC_PORT, ClockSyncClient, FrameStamp,
                                parse_jpeg_stamp)
     from .head_pose_udp import HeadPoseUdpSender, _validated_pose_matrix, enabled
 except ImportError:
+    from display_feed import (  # type: ignore[no-redef]
+        DEFAULT_DISPLAY_PORT, DisplayFeedReceiver, relay_to_vuer)
     from frame_timing import (  # type: ignore[no-redef]
         DEFAULT_SYNC_PORT, ClockSyncClient, FrameStamp, parse_jpeg_stamp)
     from head_pose_udp import (  # type: ignore[no-redef]
@@ -53,9 +63,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--img-server-ip", default="192.168.123.164", help="PC2 address")
     parser.add_argument("--zmq-port", type=int, default=55555,
                         help="teleimager head_camera ZMQ port")
-    parser.add_argument("--display-fps", type=positive_rate, default=30.0)
+    parser.add_argument("--display-port", type=int, default=DEFAULT_DISPLAY_PORT,
+                        help="PC2 per-eye display stream ZMQ port (scale/quality/fps are set "
+                             "on the PC2 server: --display-scale/-jpeg-quality/-fps)")
+    parser.add_argument("--legacy-display", action="store_true",
+                        help="earlier path for comparison: decode the recording stream on the "
+                             "Host and let Vuer re-encode it (uses --display-fps/--jpeg-quality)")
+    parser.add_argument("--display-fps", type=positive_rate, default=30.0,
+                        help="--legacy-display only")
     parser.add_argument("--jpeg-quality", type=int, default=80,
-                        help="JPEG quality of the per-eye images sent to the Quest")
+                        help="--legacy-display only: JPEG quality of the per-eye images "
+                             "Vuer sends to the Quest")
     parser.add_argument("--distance", type=float, default=1.0,
                         help="virtual distance of the image plane [m]")
     parser.add_argument("--screen-y", type=float, default=-0.1,
@@ -76,7 +94,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.no_neck:
         args.neck_pose_ip = None
-    for name in ("zmq_port", "neck_pose_port", "clock_sync_port"):
+    for name in ("zmq_port", "display_port", "neck_pose_port", "clock_sync_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be in 1..65535")
     if not 1 <= args.jpeg_quality <= 100:
@@ -274,7 +292,9 @@ def run(args: argparse.Namespace) -> int:
     from vuer import Vuer
     from vuer.schemas import ImageBackground
 
-    receiver = ZmqStereoReceiver(args.img_server_ip, args.zmq_port)
+    legacy = args.legacy_display
+    receiver = ZmqStereoReceiver(args.img_server_ip, args.zmq_port) if legacy else None
+    feed = None if legacy else DisplayFeedReceiver(args.img_server_ip, args.display_port)
     clock_sync = (None if args.no_clock_sync
                   else ClockSyncClient(args.img_server_ip, args.clock_sync_port))
     forwarder = (HeadPoseForwarder(args.neck_pose_ip, args.neck_pose_port, args.neck_pose_rate)
@@ -327,7 +347,8 @@ def run(args: argparse.Namespace) -> int:
             if now - last_report >= 2.0:
                 received = receiver.frames - last_frames
                 text = (f"[zmq_stereo_vr] received {received / (now - last_report):.1f} fps, "
-                        f"sent {shown / (now - last_report):.1f} fps")
+                        f"forwarded to Vuer {shown / (now - last_report):.1f} fps "
+                        "(handed to Vuer, not the Quest's displayed fps)")
                 clock = clock_sync.estimate() if clock_sync is not None else None
                 if stamp is not None and clock is not None:
                     age = (time.monotonic_ns() - clock.pc2_to_host_ns(
@@ -339,8 +360,25 @@ def run(args: argparse.Namespace) -> int:
                 last_report, shown, last_frames = now, 0, receiver.frames
             await asyncio.sleep(period)
 
-    app.spawn(start=False)(show_stereo)
-    print(f"[zmq_stereo_vr] ZMQ tcp://{args.img_server_ip}:{args.zmq_port} -> Vuer :8012; "
+    def image_age_ms(frame) -> Optional[float]:
+        clock = clock_sync.estimate() if clock_sync is not None else None
+        if clock is None:
+            return None
+        return (time.monotonic_ns()
+                - clock.pc2_to_host_ns(frame.capture_pc2_monotonic_ns)) / 1e6
+
+    async def relay_display(session):
+        await relay_to_vuer(session, feed, ImageBackground, screen_y=args.screen_y,
+                            distance=args.distance, tag="zmq_stereo_vr", age_ms=image_age_ms)
+
+    if legacy:
+        app.spawn(start=False)(show_stereo)
+        source = f"ZMQ tcp://{args.img_server_ip}:{args.zmq_port} (legacy: Host decode + Vuer re-encode)"
+    else:
+        app.spawn(start=False)(relay_display)
+        source = (f"display ZMQ tcp://{args.img_server_ip}:{args.display_port} "
+                  "(PC2 JPEG relayed unchanged)")
+    print(f"[zmq_stereo_vr] {source} -> Vuer :8012; "
           "open https://<host-ip>:8012/?ws=wss://<host-ip>:8012 in the Quest", flush=True)
     try:
         app.run()
@@ -351,7 +389,10 @@ def run(args: argparse.Namespace) -> int:
             forwarder.close()
         if clock_sync is not None:
             clock_sync.close()
-        receiver.close()
+        if receiver is not None:
+            receiver.close()
+        if feed is not None:
+            feed.close()
     return 0
 
 

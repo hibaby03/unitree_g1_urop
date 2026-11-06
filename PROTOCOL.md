@@ -124,6 +124,35 @@ FF D8 | FF FE | length=30 (uint16) | 28-byte payload | original JPEG after SOI
 
 Python format string: `!4sBBHIQQ`
 
+# Display stream v1 (PC2 → Host, ZMQ PUB/SUB, default port 55556)
+
+`pc2/zed_teleimager_server.py` publishes one **single-part** ZMQ message per
+display frame (single-part so the Host can use `CONFLATE` and keep only the
+newest). It holds both eyes of the same ZED capture, already split, scaled and
+JPEG-encoded on PC2. The Host (`host/display_feed.py`) hands the two JPEGs to
+Vuer unchanged. The recording stream (teleimager, port 55555) is separate and is
+not affected by display scale, quality or rate. Network byte order.
+
+| Offset | Size | Type | Name | Description |
+| ---: | ---: | --- | --- | --- |
+| 0 | 4 | bytes | magic | ASCII `ADSP` |
+| 4 | 1 | uint8 | version | `1` |
+| 5 | 1 | uint8 | flags | Zero |
+| 6 | 2 | uint16 | reserved | Zero |
+| 8 | 4 | uint32 | frame_sequence | Same counter as the recording stream's `AFTS` stamp |
+| 12 | 8 | uint64 | capture_pc2_monotonic_ns | PC2 `time.monotonic_ns()` right after the ZED `grab()` |
+| 20 | 8 | uint64 | zed_image_time_ns | ZED SDK image timestamp, diagnostics only; `0` if unavailable |
+| 28 | 4 | uint32 | left_len | Length of the left-eye JPEG |
+| 32 | 4 | uint32 | right_len | Length of the right-eye JPEG |
+| 36 | 2 | uint16 | eye_width | Width of one (scaled) eye image in pixels |
+| 38 | 2 | uint16 | eye_height | Height of one (scaled) eye image in pixels |
+| 40 | left_len | bytes | left_jpeg | Complete JPEG (starts with `FF D8`) |
+| 40 + left_len | right_len | bytes | right_jpeg | Complete JPEG |
+
+Python format string of the header: `!4sBBHIQQIIHH` (40 bytes). The Host rejects a
+message whose total length is not `40 + left_len + right_len`, that has an empty
+eye, or whose eyes do not start with a JPEG SOI marker.
+
 # Clock sync v1 (Host ↔ PC2, UDP 5007)
 
 The Host sends a 20-byte request; PC2 answers with a 36-byte reply to the

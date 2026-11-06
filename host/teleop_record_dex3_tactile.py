@@ -88,6 +88,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--display-mode", choices=["immersive", "ego", "pass-through"],
                         default="immersive", help="legacy fork supports immersive only")
     parser.add_argument("--screen-y", type=float, default=-0.1)
+    parser.add_argument("--display-port", type=int, default=55556,
+                        help="PC2 per-eye display stream (ZMQ) shown in the Quest; "
+                             "recording keeps using the full-resolution stream")
+    parser.add_argument("--legacy-display", action="store_true",
+                        help="show the recording frames through the earlier Host "
+                             "decode + Vuer re-encode path (for comparison)")
     parser.add_argument("--cert")
     parser.add_argument("--key")
     parser.add_argument("--check", action="store_true", help="check installed APIs without hardware")
@@ -123,7 +129,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.no_bridge:
         args.bridge_ip = None
-    for name in ("neck_pose_port", "neck_state_port", "clock_sync_port"):
+    for name in ("neck_pose_port", "neck_state_port", "clock_sync_port", "display_port"):
         if not 1 <= getattr(args, name) <= 65535:
             parser.error(f"--{name.replace('_', '-')} must be in 1..65535")
     if args.display_mode != "immersive":
@@ -662,7 +668,9 @@ def run(args: argparse.Namespace) -> int:
         if shape[1] % 2:
             raise ValueError("stereo combined width must be even")
         xr = LegacyStereoXR(TeleVuerWrapper, shape, cert, key,
-                            screen_y=args.screen_y, fps=args.frequency)
+                            screen_y=args.screen_y, fps=args.frequency,
+                            display_feed=(None if args.legacy_display
+                                          else (args.img_server_ip, args.display_port)))
         neck_state = NeckStateReceiver(args.neck_state_bind, args.neck_state_port)
         if not args.no_clock_sync:
             clock_sync = ClockSyncClient(args.img_server_ip, args.clock_sync_port)
